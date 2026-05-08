@@ -42,6 +42,20 @@ defmodule Bumblebee.Vision.Qwen3VLFeaturizer do
     merge_size: [
       default: 2,
       doc: "the merge factor for spatial patches"
+    ],
+    min_pixels: [
+      default: nil,
+      doc:
+        "minimum number of pixels for `smart_resize`. If set, the input image is" <>
+          " resized so that the (height, width) area is at least this value. Loaded" <>
+          " from `size.shortest_edge` in `preprocessor_config.json`."
+    ],
+    max_pixels: [
+      default: nil,
+      doc:
+        "maximum number of pixels for `smart_resize`. If set, the input image is" <>
+          " resized so that the (height, width) area is at most this value. Loaded" <>
+          " from `size.longest_edge`."
     ]
   ]
 
@@ -110,24 +124,57 @@ defmodule Bumblebee.Vision.Qwen3VLFeaturizer do
       |> Nx.as_type(:f32)
       |> Image.normalize_channels(length(featurizer.image_mean))
 
-    # Qwen3VL requires image dimensions to be divisible by patch_size * merge_size
-    factor = featurizer.patch_size * featurizer.merge_size
-
     {_, h, w, _} = Nx.shape(frame)
 
-    # Compute target size - round to nearest multiple of factor
-    target_h = round_to_multiple(h, factor)
-    target_w = round_to_multiple(w, factor)
-
-    # Ensure minimum size
-    target_h = max(target_h, factor)
-    target_w = max(target_w, factor)
+    # Image dimensions must be multiples of patch_size * merge_size so the
+    # vision encoder can divide them into patches and then group those into
+    # spatial-merge blocks. Beyond that, when min_pixels / max_pixels are
+    # configured (Python's `smart_resize`), respect the [min_pixels,
+    # max_pixels] area window while preserving aspect ratio.
+    factor = featurizer.patch_size * featurizer.merge_size
+    {target_h, target_w} = smart_resize(h, w, factor, featurizer.min_pixels, featurizer.max_pixels)
 
     NxImage.resize(frame, {target_h, target_w}, method: featurizer.resize_method)
   end
 
+  # Picks a (height, width) such that:
+  #   - both are multiples of `factor`,
+  #   - both are at least `factor` (so we always have at least one patch),
+  #   - their product (the pixel area) lies in [min_pixels, max_pixels],
+  #     when those bounds are set,
+  #   - the aspect ratio of the input is preserved as closely as possible.
+  defp smart_resize(h, w, factor, min_pixels, max_pixels) do
+    h_bar = max(round_to_multiple(h, factor), factor)
+    w_bar = max(round_to_multiple(w, factor), factor)
+
+    cond do
+      is_integer(max_pixels) and h_bar * w_bar > max_pixels ->
+        beta = :math.sqrt(h * w / max_pixels)
+        h_b = max(floor_to_multiple(h / beta, factor), factor)
+        w_b = max(floor_to_multiple(w / beta, factor), factor)
+        {h_b, w_b}
+
+      is_integer(min_pixels) and h_bar * w_bar < min_pixels ->
+        beta = :math.sqrt(min_pixels / (h * w))
+        h_b = max(ceil_to_multiple(h * beta, factor), factor)
+        w_b = max(ceil_to_multiple(w * beta, factor), factor)
+        {h_b, w_b}
+
+      true ->
+        {h_bar, w_bar}
+    end
+  end
+
   defp round_to_multiple(value, factor) do
-    div(value + div(factor, 2), factor) * factor
+    div(round(value) + div(factor, 2), factor) * factor
+  end
+
+  defp floor_to_multiple(value, factor) do
+    div(trunc(value), factor) * factor
+  end
+
+  defp ceil_to_multiple(value, factor) do
+    Kernel.ceil(value / factor) * factor
   end
 
   @impl true
@@ -224,7 +271,6 @@ defmodule Bumblebee.Vision.Qwen3VLFeaturizer do
       opts =
         convert!(data,
           resize: {"do_resize", boolean()},
-          size: {"size", image_size()},
           resize_method: {"resample", resize_method()},
           normalize: {"do_normalize", boolean()},
           image_mean: {"image_mean", list(number())},
@@ -233,6 +279,25 @@ defmodule Bumblebee.Vision.Qwen3VLFeaturizer do
           temporal_patch_size: {"temporal_patch_size", number()},
           merge_size: {"merge_size", number()}
         )
+
+      # Qwen3-VL preprocessor_config.json carries `size` as a pixel-area
+      # window: `{"shortest_edge": min_pixels, "longest_edge": max_pixels}`.
+      # Older configs use `{"height": h, "width": w}` for a fixed target. We
+      # branch on the keys present and populate the corresponding featurizer
+      # fields. (The `image_size/0` converter doesn't recognise the
+      # area-window form, so we read it manually.)
+      opts =
+        case Map.get(data, "size") do
+          %{"shortest_edge" => min_p, "longest_edge" => max_p}
+          when is_integer(min_p) and is_integer(max_p) ->
+            Keyword.merge(opts, min_pixels: min_p, max_pixels: max_p)
+
+          %{"height" => h, "width" => w} when is_integer(h) and is_integer(w) ->
+            Keyword.put(opts, :size, %{height: h, width: w})
+
+          _ ->
+            opts
+        end
 
       @for.config(featurizer, opts)
     end
