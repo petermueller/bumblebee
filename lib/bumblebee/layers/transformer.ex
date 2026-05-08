@@ -866,6 +866,7 @@ defmodule Bumblebee.Layers.Transformer do
               :position_ids,
               :max_positions,
               :scaling_strategy,
+              :mrope_section,
               base: 10_000,
               percentage: 1.0
             ])

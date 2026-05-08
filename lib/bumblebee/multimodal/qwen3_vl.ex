@@ -18,6 +18,15 @@ defmodule Bumblebee.Multimodal.Qwen3VL do
       vision_end_token_id: [
         default: 151_653,
         doc: "the token ID marking the end of visual content"
+      ],
+      mrope_section: [
+        default: nil,
+        doc:
+          "splits per axis (temporal, height, width) for multi-axis rotary" <>
+            " position embedding (mRoPE). When set, the text decoder uses 3-axis" <>
+            " position ids and rotates each frequency dim against its assigned axis." <>
+            " Loaded from `text_config.rope_scaling.mrope_section` (Qwen3-VL) or" <>
+            " `text_config.rope_parameters.mrope_section` (Qwen3.5)."
       ]
     ] ++ Shared.common_options([:output_hidden_states, :output_attentions])
 
@@ -122,6 +131,93 @@ defmodule Bumblebee.Multimodal.Qwen3VL do
   @spec num_visual_tokens({integer(), integer(), integer()}, map()) :: integer()
   def num_visual_tokens({t, h, w}, vision_spec) do
     div(t * h * w, vision_spec.spatial_merge_size * vision_spec.spatial_merge_size)
+  end
+
+  @doc """
+  Computes the 3-axis position ids that mRoPE needs.
+
+  For text tokens, all three axes (temporal, height, width) advance
+  together as a normal sequence position. For image-pad tokens, the
+  three axes encode the patch's `(t, h, w)` coordinates inside the
+  image grid, so the model can rotate-position-embed each visual token
+  according to where it sits spatially. After an image block, text
+  resumes at `max(llm_grid_h, llm_grid_w)` past where the image started,
+  matching the HuggingFace `get_rope_index` rule.
+
+  Returns a tensor of shape `{3, batch, seq_len}`.
+
+      input_ids = Bumblebee.apply_tokenizer(tokenizer, prompt)["input_ids"]
+      position_ids =
+        Bumblebee.Multimodal.Qwen3VL.position_ids(
+          input_ids,
+          {1, 30, 40},
+          spec
+        )
+  """
+  @spec position_ids(Nx.Tensor.t(), {integer(), integer(), integer()}, %__MODULE__{}) ::
+          Nx.Tensor.t()
+  def position_ids(input_ids, {grid_t, grid_h, grid_w}, %__MODULE__{} = spec) do
+    {batch, _seq} = Nx.shape(input_ids)
+    image_token_id = spec.image_token_id
+    spatial_merge_size = spec.vision_spec.spatial_merge_size
+
+    llm_grid_t = grid_t
+    llm_grid_h = div(grid_h, spatial_merge_size)
+    llm_grid_w = div(grid_w, spatial_merge_size)
+    total_visual_tokens = llm_grid_t * llm_grid_h * llm_grid_w
+
+    rows =
+      for b <- 0..(batch - 1) do
+        ids = Nx.to_list(input_ids[[b, ..]])
+
+        triples =
+          walk_position_ids(ids, image_token_id, llm_grid_t, llm_grid_h, llm_grid_w,
+            total_visual_tokens, 0, [])
+
+        {ts, hs, ws} =
+          Enum.reduce(triples, {[], [], []}, fn {t, h, w}, {at, ah, aw} ->
+            {[t | at], [h | ah], [w | aw]}
+          end)
+
+        {Enum.reverse(ts), Enum.reverse(hs), Enum.reverse(ws)}
+      end
+
+    t_rows = Enum.map(rows, fn {t, _, _} -> t end)
+    h_rows = Enum.map(rows, fn {_, h, _} -> h end)
+    w_rows = Enum.map(rows, fn {_, _, w} -> w end)
+
+    Nx.stack([Nx.tensor(t_rows), Nx.tensor(h_rows), Nx.tensor(w_rows)])
+  end
+
+  defp walk_position_ids([], _img_id, _t, _h, _w, _total, _current_pos, acc),
+    do: Enum.reverse(acc)
+
+  defp walk_position_ids([id | rest], img_id, gt, gh, gw, total, current_pos, acc)
+       when id != img_id do
+    walk_position_ids(rest, img_id, gt, gh, gw, total, current_pos + 1,
+      [{current_pos, current_pos, current_pos} | acc])
+  end
+
+  defp walk_position_ids(ids, img_id, gt, gh, gw, total, current_pos, acc) do
+    # Head is image_token_id. The image must occupy `total` consecutive
+    # tokens; consume them as a block and emit (t, h, w) positions per the
+    # patch grid. After the block, text continues at
+    # current_pos + max(gh, gw) (HF's rule).
+    {image_run, rest_after_image} = Enum.split(ids, total)
+
+    if length(image_run) != total or Enum.any?(image_run, &(&1 != img_id)) do
+      raise ArgumentError,
+            "Expected #{total} consecutive image_token_id (#{img_id}) tokens at position " <>
+              "(post-#{length(acc)}), got a #{length(image_run)}-long run with mixed ids"
+    end
+
+    triples =
+      for i <- 0..(gt - 1), j <- 0..(gh - 1), k <- 0..(gw - 1) do
+        {i + current_pos, j + current_pos, k + current_pos}
+      end
+
+    next_pos = current_pos + max(gh, gw)
+    walk_position_ids(rest_after_image, img_id, gt, gh, gw, total, next_pos, Enum.reverse(triples) ++ acc)
   end
 
   @doc """
@@ -381,6 +477,26 @@ defmodule Bumblebee.Multimodal.Qwen3VL do
         Layers.default_position_ids(embeddings)
       end
 
+    # When mRoPE is enabled the rotary layer expects {3, batch, seq}.
+    # If the caller only supplied 2D position_ids (e.g. for a text-only
+    # input), broadcast to all three axes — that's exactly what HF's
+    # Qwen3VLTextRotaryEmbedding does for the rank-2 case.
+    position_ids =
+      if spec.mrope_section do
+        Axon.nx(position_ids, fn pids ->
+          case Nx.rank(pids) do
+            2 ->
+              {batch, seq} = Nx.shape(pids)
+              Nx.broadcast(pids, {3, batch, seq})
+
+            3 ->
+              pids
+          end
+        end)
+      else
+        position_ids
+      end
+
     # Build query and key normalization functions for Qwen3
     query_norm =
       if text_spec.use_qk_norm do
@@ -443,12 +559,13 @@ defmodule Bumblebee.Multimodal.Qwen3VL do
             activation: text_spec.activation,
             initializer_scale: text_spec.initializer_scale
           ),
-        rotary_embedding: [
-          position_ids: position_ids,
-          max_positions: text_spec.max_positions,
-          base: text_spec.rotary_embedding_base,
-          scaling_strategy: text_spec.rotary_embedding_scaling_strategy
-        ],
+        rotary_embedding:
+          [
+            position_ids: position_ids,
+            max_positions: text_spec.max_positions,
+            base: text_spec.rotary_embedding_base,
+            scaling_strategy: text_spec.rotary_embedding_scaling_strategy
+          ] ++ if(spec.mrope_section, do: [mrope_section: spec.mrope_section], else: []),
         query_norm: query_norm,
         key_norm: key_norm,
         post_block_hook: post_block_hook,
@@ -560,6 +677,31 @@ defmodule Bumblebee.Multimodal.Qwen3VL do
       # Load text spec from text_config first to get hidden_size
       text_data = Map.get(data, "text_config", data)
 
+      # mrope_section lives nested under either rope_scaling (Qwen3-VL) or
+      # rope_parameters (Qwen3.5) in the text config. Pull it out into the
+      # top-level multimodal opts when present, but only if it makes
+      # arithmetic sense for this checkpoint — some tiny test fixtures
+      # carry a parent config's mrope_section that doesn't sum to the
+      # checkpoint's actual head_dim/2.
+      opts =
+        case extract_mrope_section(text_data) do
+          nil ->
+            opts
+
+          {t, h, w} = section ->
+            if mrope_section_fits?(text_data, section) do
+              Keyword.put(opts, :mrope_section, section)
+            else
+              IO.warn(
+                "ignoring mrope_section #{inspect([t, h, w])}: it does not match this " <>
+                  "checkpoint's head_dim. mRoPE will be disabled and standard 1D rotary " <>
+                  "will be used."
+              )
+
+              opts
+            end
+        end
+
       # Qwen3-VL uses QK-norm in the text model (same as standalone Qwen3)
       text_spec =
         Bumblebee.configure(Bumblebee.Text.Qwen3,
@@ -583,6 +725,40 @@ defmodule Bumblebee.Multimodal.Qwen3VL do
         %{spec | vision_spec: vision_spec, text_spec: text_spec},
         opts
       )
+    end
+
+    defp extract_mrope_section(text_data) do
+      cond do
+        section = get_in(text_data, ["rope_scaling", "mrope_section"]) -> normalize(section)
+        section = get_in(text_data, ["rope_parameters", "mrope_section"]) -> normalize(section)
+        true -> nil
+      end
+    end
+
+    defp normalize([t, h, w]), do: {t, h, w}
+    defp normalize(_), do: nil
+
+    # Checks that t + h + w equals the rotary half-width
+    # head_dim * partial_rotary_factor / 2 derived from the text config.
+    defp mrope_section_fits?(text_data, {t, h, w}) do
+      head_dim =
+        Map.get(text_data, "head_dim") ||
+          (case {Map.get(text_data, "hidden_size"), Map.get(text_data, "num_attention_heads")} do
+             {hs, na} when is_integer(hs) and is_integer(na) and na > 0 -> div(hs, na)
+             _ -> nil
+           end)
+
+      partial =
+        get_in(text_data, ["rope_parameters", "partial_rotary_factor"]) ||
+          Map.get(text_data, "partial_rotary_factor") ||
+          1.0
+
+      with hd when is_integer(hd) <- head_dim do
+        rotary_size = trunc(hd * partial)
+        rem(rotary_size, 2) == 0 and t + h + w == div(rotary_size, 2)
+      else
+        _ -> false
+      end
     end
   end
 

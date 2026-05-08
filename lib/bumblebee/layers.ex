@@ -1223,13 +1223,36 @@ defmodule Bumblebee.Layers do
 
   @doc """
   Adds a rotary embedding layer to the network.
+
+  ## Options
+
+    * `:mrope_section` - when set, applies multi-axis rotary embedding
+      (mRoPE) as used by Qwen2-VL / Qwen3-VL / Qwen3.5. The value is a
+      three-tuple `{t, h, w}` whose entries sum to `size / 2`. With
+      mRoPE, `position_ids` is expected to have shape `{3, batch, seq}`
+      (one row per axis: temporal, height, width) instead of the usual
+      `{batch, seq}`.
+
   """
   def rotary_embedding(query, key, position_ids, attention_mask, size, opts \\ []) do
-    opts = Keyword.validate!(opts, [:name, :scaling_strategy, max_positions: 2048, base: 10_000])
+    opts =
+      Keyword.validate!(opts, [
+        :name,
+        :scaling_strategy,
+        :mrope_section,
+        max_positions: 2048,
+        base: 10_000
+      ])
+
+    apply_fun =
+      case opts[:mrope_section] do
+        nil -> &apply_rotary_embedding/5
+        _ -> &apply_mrope_rotary_embedding/5
+      end
 
     output =
       Axon.layer(
-        &apply_rotary_embedding/5,
+        apply_fun,
         [query, key, position_ids, Axon.optional(attention_mask)],
         [size: size] ++ opts
       )
@@ -1407,6 +1430,119 @@ defmodule Bumblebee.Layers do
     x1 = x[[.., .., .., 0..(size - 1)//1]]
     x2 = x[[.., .., .., size..-1//1]]
     Nx.concatenate([-x2, x1], axis: -1)
+  end
+
+  # Multi-axis rotary (mRoPE), per Qwen2-VL / Qwen3-VL.
+  #
+  # Expects `position_ids` of shape `{3, batch, seq}` — one row per axis
+  # (temporal, height, width). Builds a single cos/sin table from the
+  # standard 1D recipe, indexes it per axis to get three `{batch, seq, dim/2}`
+  # frequency tensors, then *interleaves* them so that each frequency dim
+  # is sourced from the right axis according to `mrope_section`. The
+  # interleaving pattern matches HF transformers' `apply_interleaved_mrope`.
+  defnp apply_mrope_rotary_embedding(query, key, position_ids, attention_mask, opts \\ []) do
+    opts =
+      keyword!(opts, [
+        :size,
+        :scaling_strategy,
+        :mrope_section,
+        mode: :inference,
+        max_positions: 2048,
+        base: 10_000
+      ])
+
+    sequence_length =
+      case attention_mask do
+        %Axon.None{} -> Nx.axis_size(position_ids, -1)
+        _other -> Nx.axis_size(attention_mask, 1)
+      end
+
+    {cos, sin} =
+      create_sinusoidal_positions(
+        sequence_length,
+        opts[:max_positions],
+        opts[:size],
+        opts[:base],
+        opts[:scaling_strategy]
+      )
+
+    # cos/sin shape: (max_positions, size).
+    # Slice off the head_dim/2 frequency table (the second half is just
+    # a duplicate of the first, since `positions_cos_sin` does a doubling
+    # concat). We need the un-duplicated version to interleave per axis,
+    # then re-double afterward.
+    half = div(opts[:size], 2)
+    cos_half = cos[[.., 0..(half - 1)//1]]
+    sin_half = sin[[.., 0..(half - 1)//1]]
+
+    position_ids = Nx.as_type(position_ids, :s64)
+
+    # Take per axis: shapes (3, batch, seq, half).
+    cos_per_axis = Nx.take(cos_half, position_ids)
+    sin_per_axis = Nx.take(sin_half, position_ids)
+
+    # Build three masks of shape (half,), one-hot over which axis each
+    # frequency index sources from. Computed at compile time from the
+    # mrope_section tuple.
+    {t_mask, h_mask, w_mask} =
+      mrope_axis_masks(opts[:mrope_section], half, Nx.type(query))
+
+    cos_t = cos_per_axis[[0, .., .., ..]]
+    cos_h = cos_per_axis[[1, .., .., ..]]
+    cos_w = cos_per_axis[[2, .., .., ..]]
+
+    sin_t = sin_per_axis[[0, .., .., ..]]
+    sin_h = sin_per_axis[[1, .., .., ..]]
+    sin_w = sin_per_axis[[2, .., .., ..]]
+
+    cos_half = cos_t * t_mask + cos_h * h_mask + cos_w * w_mask
+    sin_half = sin_t * t_mask + sin_h * h_mask + sin_w * w_mask
+
+    # Re-double to full size by concatenating the half with itself along
+    # the last axis, matching positions_cos_sin's layout.
+    cos = Nx.concatenate([cos_half, cos_half], axis: -1) |> Nx.new_axis(2) |> Nx.as_type(Nx.type(query))
+    sin = Nx.concatenate([sin_half, sin_half], axis: -1) |> Nx.new_axis(2) |> Nx.as_type(Nx.type(query))
+
+    rotated_query = query * cos + rotate_half(query) * sin
+    rotated_key = key * cos + rotate_half(key) * sin
+
+    {rotated_query, rotated_key}
+  end
+
+  # Produces three {1, 1, half} tensors that, multiplied with the three
+  # per-axis frequency tensors, pick the right axis per frequency index.
+  # Mirrors HF's apply_interleaved_mrope: indices [0, 3, 6, ...] go to T,
+  # [1, 4, 7, ...] to H (up to h_size*3), [2, 5, 8, ...] to W (up to
+  # w_size*3); any tail indices stay on T.
+  deftransformp mrope_axis_masks(mrope_section, half, dtype) do
+    {t_size, h_size, w_size} =
+      case mrope_section do
+        [t, h, w] -> {t, h, w}
+        {t, h, w} -> {t, h, w}
+      end
+
+    if t_size + h_size + w_size != half do
+      raise ArgumentError,
+            "mrope_section #{inspect(mrope_section)} must sum to size/2 = #{half}, got #{t_size + h_size + w_size}"
+    end
+
+    {t_indicators, h_indicators, w_indicators} =
+      Enum.reduce(0..(half - 1), {[], [], []}, fn k, {ts, hs, ws} ->
+        cond do
+          k < h_size * 3 and rem(k, 3) == 1 -> {[0.0 | ts], [1.0 | hs], [0.0 | ws]}
+          k < w_size * 3 and rem(k, 3) == 2 -> {[0.0 | ts], [0.0 | hs], [1.0 | ws]}
+          true -> {[1.0 | ts], [0.0 | hs], [0.0 | ws]}
+        end
+      end)
+
+    to_mask = fn list ->
+      list
+      |> Enum.reverse()
+      |> Nx.tensor(type: dtype)
+      |> Nx.reshape({1, 1, half})
+    end
+
+    {to_mask.(t_indicators), to_mask.(h_indicators), to_mask.(w_indicators)}
   end
 
   @doc """
