@@ -41,7 +41,8 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
           repo: :string,
           image: :string,
           prompt: :string,
-          show_logits: :integer
+          show_logits: :integer,
+          no_mrope: :boolean
         ]
       )
 
@@ -49,6 +50,7 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
     image_path = opts[:image] || @default_image
     prompt_text = opts[:prompt] || @default_prompt
     show_logits = opts[:show_logits] || 16
+    no_mrope? = opts[:no_mrope] || false
 
     Mix.Task.run("app.start")
     Nx.global_default_backend(EXLA.Backend)
@@ -58,8 +60,8 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
     Mix.shell().info("=== Running PyTorch reference ===")
     py_data = run_python_reference(repo, image_path, prompt_text)
 
-    Mix.shell().info("=== Running Bumblebee ===")
-    bb_data = run_bumblebee(repo, image_path, py_data)
+    Mix.shell().info("=== Running Bumblebee#{if no_mrope?, do: " (mRoPE DISABLED)", else: ""} ===")
+    bb_data = run_bumblebee(repo, image_path, py_data, no_mrope?: no_mrope?)
 
     Mix.shell().info("=== Comparison ===")
     compare(py_data, bb_data, show_logits)
@@ -147,13 +149,26 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
     Pythonx.decode(result)
   end
 
-  defp run_bumblebee(repo, image_path, py_data) do
+  defp run_bumblebee(repo, image_path, py_data, opts) do
+    no_mrope? = Keyword.get(opts, :no_mrope?, false)
+
     {:ok, model_info} = Bumblebee.load_model({:hf, repo})
     {:ok, tokenizer} = Bumblebee.load_tokenizer({:hf, repo})
     {:ok, featurizer} = Bumblebee.load_featurizer({:hf, repo})
 
     [t, h, w] = py_data["image_grid_thw"] |> List.first()
     model_info = Bumblebee.Multimodal.Qwen3VL.with_image_grid(model_info, t: t, h: h, w: w)
+
+    # Optionally drop mrope_section to fall back to standard 1D rotary —
+    # used as an A/B test when investigating where logit drift comes from.
+    model_info =
+      if no_mrope? do
+        new_spec = %{model_info.spec | mrope_section: nil}
+        new_model = new_spec.__struct__.model(new_spec)
+        %{model_info | spec: new_spec, model: new_model}
+      else
+        model_info
+      end
 
     image = StbImage.read_file!(image_path)
     image_inputs = Bumblebee.apply_featurizer(featurizer, image)
@@ -170,15 +185,23 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
     input_ids = Nx.tensor([py_data["input_ids"]])
     seq_len = length(py_data["input_ids"])
 
-    position_ids =
-      Bumblebee.Multimodal.Qwen3VL.position_ids(input_ids, {t, h, w}, model_info.spec)
-
-    inputs = %{
+    base_inputs = %{
       "input_ids" => input_ids,
       "pixel_values" => image_inputs["pixel_values"],
-      "position_ids" => position_ids,
       "attention_mask" => Nx.broadcast(1, {1, seq_len})
     }
+
+    # With mRoPE on, build 3-axis position ids; without it, leave the
+    # slot empty and let the standard 1D default kick in.
+    inputs =
+      if no_mrope? do
+        base_inputs
+      else
+        position_ids =
+          Bumblebee.Multimodal.Qwen3VL.position_ids(input_ids, {t, h, w}, model_info.spec)
+
+        Map.put(base_inputs, "position_ids", position_ids)
+      end
 
     outputs = Axon.predict(model_info.model, model_info.params, inputs)
 
