@@ -87,8 +87,13 @@ defmodule Bumblebee.Multimodal.Qwen3VL do
     flattened_patch_size =
       vision_spec.num_channels * temporal_patch_size * patch_size * patch_size
 
-    # Use 196 patches as template (14x14 grid from 224x224 image)
-    num_patches = 196
+    # If grid is configured on vision_spec, derive num_patches from it; else
+    # fall back to 14x14 (224x224 / 16) template.
+    num_patches =
+      case {vision_spec.grid_t, vision_spec.grid_h, vision_spec.grid_w} do
+        {t, h, w} when is_integer(t) and is_integer(h) and is_integer(w) -> t * h * w
+        _ -> 196
+      end
 
     %{
       "pixel_values" => Nx.template({num_patches, flattened_patch_size}, :f32),

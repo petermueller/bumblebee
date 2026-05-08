@@ -66,6 +66,23 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
         default: 0.02,
         doc:
           "the standard deviation of the normal initializer used for initializing kernel parameters"
+      ],
+      grid_t: [
+        default: nil,
+        doc:
+          "temporal patch count of the input image/video. When set, used instead of falling back" <>
+            " to a `sqrt(num_patches)` square-grid guess. For images, this is 1."
+      ],
+      grid_h: [
+        default: nil,
+        doc:
+          "height patch count of the input image/video, equal to `image_height / patch_size`." <>
+            " When `grid_t`, `grid_h`, `grid_w` are all set, the encoder uses them for position" <>
+            " embedding interpolation, 2D rotary, and the spatial merger."
+      ],
+      grid_w: [
+        default: nil,
+        doc: "width patch count of the input image/video, equal to `image_width / patch_size`."
       ]
     ]
 
@@ -114,15 +131,18 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
 
   @impl true
   def input_template(spec) do
-    # Template for pre-extracted patches
-    # For a 224x224 image: 224/16 = 14 patches per side, 14*14 = 196 patches
-    # With temporal duplication (1->2), patches_t = 1
-    # Total patches = 1 * 14 * 14 = 196
+    # Template for pre-extracted patches.
+    # If grid_t/grid_h/grid_w are configured, use them; otherwise fall back
+    # to a 14x14 (224x224 / 16) square grid template.
     patch_size = spec.patch_size
     temporal_patch_size = spec.temporal_patch_size
     flattened_patch_size = spec.num_channels * temporal_patch_size * patch_size * patch_size
-    # Use 196 patches as template (14x14 grid from 224x224 image)
-    num_patches = 196
+
+    num_patches =
+      case {spec.grid_t, spec.grid_h, spec.grid_w} do
+        {t, h, w} when is_integer(t) and is_integer(h) and is_integer(w) -> t * h * w
+        _ -> 196
+      end
 
     %{
       "pixel_values" => Nx.template({num_patches, flattened_patch_size}, :f32)
@@ -274,18 +294,23 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
         # pos_embed: {num_position_embeddings, hidden_size} = {2304, 1024} = {48*48, 1024}
         {_batch, num_patches, _hidden_size} = Nx.shape(embed)
 
-        # Compute target grid size (assuming square grid)
-        grid_size = :math.sqrt(num_patches) |> trunc()
+        # Target grid: prefer grid_h/grid_w from spec; else fall back to a
+        # square grid via sqrt(num_patches) (legacy path, only correct for
+        # perfectly square images).
+        {grid_h, grid_w} =
+          case {spec.grid_h, spec.grid_w} do
+            {h, w} when is_integer(h) and is_integer(w) -> {h, w}
+            _ -> {trunc(:math.sqrt(num_patches)), trunc(:math.sqrt(num_patches))}
+          end
 
         # Source grid size (48x48)
         src_grid_size = :math.sqrt(spec.num_position_embeddings) |> trunc()
 
         # Bilinear interpolation from src_grid to target grid
-        # For each patch at (row, col), compute interpolated position embedding
 
-        # Create target grid indices
-        h_idxs = Nx.linspace(0, src_grid_size - 1, n: grid_size, type: :f32)
-        w_idxs = Nx.linspace(0, src_grid_size - 1, n: grid_size, type: :f32)
+        # Create target grid indices (h, w may differ)
+        h_idxs = Nx.linspace(0, src_grid_size - 1, n: grid_h, type: :f32)
+        w_idxs = Nx.linspace(0, src_grid_size - 1, n: grid_w, type: :f32)
 
         # Floor and ceil indices
         h_floor = Nx.floor(h_idxs) |> Nx.as_type(:s32)
@@ -297,19 +322,14 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
         dh = Nx.subtract(h_idxs, Nx.as_type(h_floor, :f32))
         dw = Nx.subtract(w_idxs, Nx.as_type(w_floor, :f32))
 
-        # Compute indices into pos_embed (which is stored as 1D array of 48*48)
-        # For a 2D grid position (r, c), the 1D index is r * src_grid_size + c
+        # Reshape for broadcasting: h indices along first dim (grid_h, 1),
+        # w indices along second (1, grid_w)
+        h_floor_2d = Nx.reshape(h_floor, {grid_h, 1})
+        h_ceil_2d = Nx.reshape(h_ceil, {grid_h, 1})
+        w_floor_2d = Nx.reshape(w_floor, {1, grid_w})
+        w_ceil_2d = Nx.reshape(w_ceil, {1, grid_w})
 
-        # Create all (h, w) pairs for the target grid
-        # We need indices for all 4 corners of each bilinear interpolation
-
-        # Reshape for broadcasting: h indices along first dim, w along second
-        h_floor_2d = Nx.reshape(h_floor, {grid_size, 1})
-        h_ceil_2d = Nx.reshape(h_ceil, {grid_size, 1})
-        w_floor_2d = Nx.reshape(w_floor, {1, grid_size})
-        w_ceil_2d = Nx.reshape(w_ceil, {1, grid_size})
-
-        # 4 corner indices (each is grid_size x grid_size)
+        # 4 corner indices (each broadcasts to {grid_h, grid_w})
         idx_ff = Nx.add(Nx.multiply(h_floor_2d, src_grid_size), w_floor_2d) |> Nx.flatten()
         idx_fc = Nx.add(Nx.multiply(h_floor_2d, src_grid_size), w_ceil_2d) |> Nx.flatten()
         idx_cf = Nx.add(Nx.multiply(h_ceil_2d, src_grid_size), w_floor_2d) |> Nx.flatten()
@@ -321,9 +341,9 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
         emb_cf = Nx.take(pos_embed, idx_cf, axis: 0)
         emb_cc = Nx.take(pos_embed, idx_cc, axis: 0)
 
-        # Compute bilinear weights (grid_size x grid_size -> flattened)
-        dh_2d = Nx.reshape(dh, {grid_size, 1})
-        dw_2d = Nx.reshape(dw, {1, grid_size})
+        # Compute bilinear weights ({grid_h, grid_w} -> flattened {num_patches, 1})
+        dh_2d = Nx.reshape(dh, {grid_h, 1})
+        dw_2d = Nx.reshape(dw, {1, grid_w})
 
         w_ff =
           Nx.multiply(Nx.subtract(1.0, dh_2d), Nx.subtract(1.0, dw_2d))
@@ -384,11 +404,17 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
     rotary_2d =
       Axon.nx(embeddings, fn embed ->
         {_batch, seq_len, _hidden} = Nx.shape(embed)
-        grid_size = :math.sqrt(seq_len) |> trunc()
+
+        grid_w =
+          case spec.grid_w do
+            w when is_integer(w) -> w
+            _ -> trunc(:math.sqrt(seq_len))
+          end
+
         head_dim = div(spec.hidden_size, spec.num_attention_heads)
         rotary_dim = div(head_dim, 2)
 
-        compute_2d_rotary_embedding(seq_len, grid_size, rotary_dim, spec.rotary_embedding_base)
+        compute_2d_rotary_embedding(seq_len, grid_w, rotary_dim, spec.rotary_embedding_base)
       end)
 
     # Use custom transformer blocks with 2D rotary embedding
@@ -397,13 +423,15 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
     vision_transformer_blocks(embeddings, rotary_2d, spec, deepstack_indexes, name)
   end
 
-  # Compute 2D rotary embedding (cos, sin) for vision patches
-  # Returns {cos, sin} each of shape {seq_len, rotary_dim}
-  defnp compute_2d_rotary_embedding(seq_len, grid_size, rotary_dim, base) do
+  # Compute 2D rotary embedding (cos, sin) for vision patches.
+  # `grid_w` is the column count of the patch grid; rows are derived as
+  # `position div grid_w`, columns as `position rem grid_w`.
+  # Returns {cos, sin} each of shape {seq_len, rotary_dim}.
+  defnp compute_2d_rotary_embedding(seq_len, grid_w, rotary_dim, base) do
     # For each patch in raster scan order, compute (row, col) position
     positions = Nx.iota({seq_len})
-    row_positions = Nx.quotient(positions, grid_size)
-    col_positions = Nx.remainder(positions, grid_size)
+    row_positions = Nx.quotient(positions, grid_w)
+    col_positions = Nx.remainder(positions, grid_w)
 
     # Compute inverse frequencies (half rotary_dim because we split for row/col)
     half_rotary_dim = div(rotary_dim, 2)
@@ -520,18 +548,25 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
     # First, reshape to group spatial patches for merging (BEFORE norm)
     |> Axon.nx(fn x ->
       {batch, num_patches, hidden} = Nx.shape(x)
-      # Compute grid dimensions (assuming square grid)
-      grid_size = :math.sqrt(num_patches) |> trunc()
-      merged_grid = div(grid_size, spec.spatial_merge_size)
+
+      {grid_h, grid_w} =
+        case {spec.grid_h, spec.grid_w} do
+          {h, w} when is_integer(h) and is_integer(w) -> {h, w}
+          _ ->
+            s = trunc(:math.sqrt(num_patches))
+            {s, s}
+        end
+
+      merged_h = div(grid_h, spec.spatial_merge_size)
+      merged_w = div(grid_w, spec.spatial_merge_size)
 
       # Reshape and merge spatial patches
       x
       |> Nx.reshape(
-        {batch, merged_grid, spec.spatial_merge_size, merged_grid, spec.spatial_merge_size,
-         hidden}
+        {batch, merged_h, spec.spatial_merge_size, merged_w, spec.spatial_merge_size, hidden}
       )
       |> Nx.transpose(axes: [0, 1, 3, 2, 4, 5])
-      |> Nx.reshape({batch, merged_grid * merged_grid, merge_size * hidden})
+      |> Nx.reshape({batch, merged_h * merged_w, merge_size * hidden})
     end)
     # Layer norm on merged dimension (postshuffle_norm=True)
     |> Axon.layer_norm(
@@ -704,18 +739,25 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
     # Reshape to group spatial patches for merging
     |> Axon.nx(fn x ->
       {batch, num_patches, hidden} = Nx.shape(x)
-      # Compute grid dimensions (assuming square grid)
-      grid_size = :math.sqrt(num_patches) |> trunc()
-      merged_grid = div(grid_size, spec.spatial_merge_size)
+
+      {grid_h, grid_w} =
+        case {spec.grid_h, spec.grid_w} do
+          {h, w} when is_integer(h) and is_integer(w) -> {h, w}
+          _ ->
+            s = trunc(:math.sqrt(num_patches))
+            {s, s}
+        end
+
+      merged_h = div(grid_h, spec.spatial_merge_size)
+      merged_w = div(grid_w, spec.spatial_merge_size)
 
       # Reshape and merge spatial patches
       x
       |> Nx.reshape(
-        {batch, merged_grid, spec.spatial_merge_size, merged_grid, spec.spatial_merge_size,
-         hidden}
+        {batch, merged_h, spec.spatial_merge_size, merged_w, spec.spatial_merge_size, hidden}
       )
       |> Nx.transpose(axes: [0, 1, 3, 2, 4, 5])
-      |> Nx.reshape({batch, merged_grid * merged_grid, merge_size * hidden})
+      |> Nx.reshape({batch, merged_h * merged_w, merge_size * hidden})
     end)
     # MLP: fc1 -> activation -> fc2
     |> Axon.dense(mlp_input_size,
