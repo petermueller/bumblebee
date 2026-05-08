@@ -19,6 +19,14 @@ defmodule Bumblebee.MixProject do
     ]
   end
 
+  def cli do
+    [
+      preferred_envs: [
+        "bumblebee.compare_qwen3_vl": :test
+      ]
+    ]
+  end
+
   def application do
     [
       mod: {Bumblebee.Application, []},
@@ -26,7 +34,7 @@ defmodule Bumblebee.MixProject do
     ]
   end
 
-  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(:test), do: ["lib", "test/support", "test/mix_tasks"]
   defp elixirc_paths(_), do: ["lib"]
 
   defp deps do
@@ -37,6 +45,7 @@ defmodule Bumblebee.MixProject do
       {:nx, "~> 0.9.0 or ~> 0.10.0 or ~> 0.11.0"},
       {:exla, ">= 0.0.0", only: [:dev, :test]},
       {:torchx, ">= 0.0.0", only: [:dev, :test]},
+      {:pythonx, "~> 0.4", only: [:dev, :test]},
       # {:nx, github: "elixir-nx/nx", sparse: "nx", override: true},
       # {:exla, github: "elixir-nx/nx", sparse: "exla", override: true, only: [:dev, :test]},
       # {:torchx, github: "elixir-nx/nx", sparse: "torchx", override: true, only: [:dev, :test]},
