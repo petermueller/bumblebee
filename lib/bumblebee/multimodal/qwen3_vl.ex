@@ -77,6 +77,77 @@ defmodule Bumblebee.Multimodal.Qwen3VL do
     Shared.put_config_attrs(spec, opts)
   end
 
+  @doc """
+  Reconfigures `model_info` so its vision encoder is built for a specific
+  patch grid `(t, h, w)`.
+
+  The Qwen3-VL vision encoder uses `Nx.reshape` operations that depend on
+  the patch grid dimensions, so the Axon model graph must be rebuilt for
+  each new grid. The trained parameters are unchanged and reused.
+
+  Typical use: featurize the image first, read `image_grid_thw` to learn
+  the grid, then rebuild for that grid.
+
+      {:ok, model_info} = Bumblebee.load_model({:hf, "Qwen/Qwen3-VL-2B-Instruct"})
+      {:ok, featurizer} = Bumblebee.load_featurizer({:hf, "Qwen/Qwen3-VL-2B-Instruct"})
+
+      featurized = Bumblebee.apply_featurizer(featurizer, image)
+      [t, h, w] = featurized["image_grid_thw"][[0, ..]] |> Nx.to_list()
+
+      model_info = Bumblebee.Multimodal.Qwen3VL.with_image_grid(model_info, t: t, h: h, w: w)
+  """
+  @spec with_image_grid(map(), keyword()) :: map()
+  def with_image_grid(model_info, opts) do
+    opts = Keyword.validate!(opts, [:t, :h, :w])
+    t = Keyword.fetch!(opts, :t)
+    h = Keyword.fetch!(opts, :h)
+    w = Keyword.fetch!(opts, :w)
+
+    %{spec: spec, model: _, params: _} = model_info
+
+    vision_spec = Bumblebee.configure(spec.vision_spec, grid_t: t, grid_h: h, grid_w: w)
+    new_spec = %{spec | vision_spec: vision_spec}
+    new_model = new_spec.__struct__.model(new_spec)
+    %{model_info | spec: new_spec, model: new_model}
+  end
+
+  @doc """
+  Returns the number of post-merger visual tokens for an image with the
+  given patch grid. This is the number of `<|image_pad|>` tokens the
+  prompt should contain between `<|vision_start|>` and `<|vision_end|>`.
+
+      Bumblebee.Multimodal.Qwen3VL.num_visual_tokens({1, 30, 40}, vision_spec)
+      #=> 300
+  """
+  @spec num_visual_tokens({integer(), integer(), integer()}, map()) :: integer()
+  def num_visual_tokens({t, h, w}, vision_spec) do
+    div(t * h * w, vision_spec.spatial_merge_size * vision_spec.spatial_merge_size)
+  end
+
+  @doc """
+  Wraps a user prompt in the Qwen3-VL chat template, expanding to the
+  right number of `<|image_pad|>` tokens for the given visual-token count.
+
+  This is a convenience for callers that want to drive the model without
+  hand-assembling the chat template.
+
+      Bumblebee.Multimodal.Qwen3VL.build_chat_prompt(
+        "Describe this image briefly.",
+        num_visual_tokens: 300
+      )
+  """
+  @spec build_chat_prompt(String.t(), keyword()) :: String.t()
+  def build_chat_prompt(text, opts) do
+    num_visual_tokens = Keyword.fetch!(opts, :num_visual_tokens)
+
+    vision_block =
+      "<|vision_start|>" <>
+        String.duplicate("<|image_pad|>", num_visual_tokens) <>
+        "<|vision_end|>"
+
+    "<|im_start|>user\n" <> vision_block <> text <> "<|im_end|>\n<|im_start|>assistant\n"
+  end
+
   @impl true
   def input_template(%{vision_spec: vision_spec}) do
     # Vision input is pre-extracted patches: {num_patches, flattened_patch_size}
