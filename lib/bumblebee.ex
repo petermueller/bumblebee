@@ -245,7 +245,8 @@ defmodule Bumblebee do
   @transformers_image_processor_type_to_featurizer %{
     "BlipImageProcessor" => Bumblebee.Vision.BlipFeaturizer,
     "BitImageProcessor" => Bumblebee.Vision.BitFeaturizer,
-    "Qwen3VLImageProcessor" => Bumblebee.Vision.Qwen3VLFeaturizer
+    "Qwen3VLImageProcessor" => Bumblebee.Vision.Qwen3VLFeaturizer,
+    "Qwen2VLImageProcessorFast" => Bumblebee.Vision.Qwen3VLFeaturizer
   }
 
   @model_type_to_featurizer %{
