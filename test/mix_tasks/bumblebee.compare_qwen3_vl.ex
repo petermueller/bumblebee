@@ -120,16 +120,19 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
     )
 
     with torch.no_grad():
-        # Vision-only output (post-merger visual embeddings) for an
-        # apples-to-apples comparison against Bumblebee's vision encoder.
-        image_features = model.model.get_image_features(
-            pixel_values=inputs["pixel_values"],
-            image_grid_thw=inputs["image_grid_thw"],
+        # Vision-only output for an apples-to-apples comparison.
+        # Run the vision tower with output_hidden_states=True so we get
+        # the per-block hidden states alongside the post-merger output.
+        pv_typed = inputs["pixel_values"].type(model.model.visual.dtype)
+        vision_output = model.model.visual(
+            pv_typed,
+            grid_thw=inputs["image_grid_thw"],
+            output_hidden_states=True,
         )
-        # get_image_features returns a BaseModelOutputWithPooling whose
-        # `pooler_output` is a tuple of post-merger embeddings, one per
-        # image. We pass a single image, so take element 0.
-        visual = image_features.pooler_output[0]
+        # hidden_states is a tuple of (num_patches, hidden_size) tensors,
+        # one per block (and possibly an extra initial entry).
+        per_layer_hidden = [hs.detach().cpu().tolist() for hs in vision_output.hidden_states]
+        visual = vision_output.pooler_output
 
         out = model(**inputs, use_cache=False)
 
@@ -151,6 +154,17 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
         "visual_first_token": visual[0, :].tolist(),
         "visual_last_token": visual[-1, :].tolist(),
         "visual_mid_token": visual[visual.shape[0] // 2, :].tolist(),
+        # Sample pixel_values for byte-level comparison vs Bumblebee's featurizer.
+        "pv_first_patch_first16": inputs["pixel_values"][0, :16].tolist(),
+        "pv_mid_patch_first16": inputs["pixel_values"][inputs["pixel_values"].shape[0] // 2, :16].tolist(),
+        "per_layer_hidden_count": len(per_layer_hidden),
+        "per_layer_hidden_shape": list(vision_output.hidden_states[0].shape),
+        # First three components of one mid token, per layer, for compact
+        # dumping. Lets us track where the divergence first appears.
+        "per_layer_mid_token_first3": [
+            [hs[hs.shape[0] // 2, k].item() for k in range(3)]
+            for hs in vision_output.hidden_states
+        ],
     }
     """
 
@@ -228,13 +242,20 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
     # drift is rooted in the vision tower vs downstream processing.
     visual = run_vision_only(model_info, image_inputs["pixel_values"])
 
+    pv = image_inputs["pixel_values"]
+    {npp, _flat} = Nx.shape(pv)
+    pv_first16 = pv[[0, 0..15]] |> Nx.to_flat_list()
+    pv_mid16 = pv[[div(npp, 2), 0..15]] |> Nx.to_flat_list()
+
     %{
       "tokenizer" => tokenizer,
       "logits_step0_first_n" => outputs.logits[[.., 0, 0..127]] |> Nx.to_flat_list(),
       "logits_last_first_n" => outputs.logits[[.., -1, 0..127]] |> Nx.to_flat_list(),
       "top10_ids" => Nx.to_list(top10_ids[[0, ..]]),
       "top10_vals" => Nx.to_list(top10_vals[[0, ..]]),
-      "visual" => visual
+      "visual" => visual,
+      "pixel_values_first_patch_first16" => pv_first16,
+      "pixel_values_mid_patch_first16" => pv_mid16
     }
   end
 
@@ -260,17 +281,45 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
       frozen_parameters: %{}
     }
 
-    out = Axon.predict(vision_model, vision_params, %{"pixel_values" => pixel_values})
+    # Enable :output_hidden_states via Axon's global_layer_options so the
+    # model emits per-block hidden state tensors.
+    out =
+      Axon.predict(vision_model, vision_params, %{"pixel_values" => pixel_values},
+        global_layer_options: [output_hidden_states: true]
+      )
 
     # out.hidden_state shape: {1, num_visual_tokens, out_hidden_size}
     hs = out.hidden_state
     {1, n, _hs} = Nx.shape(hs)
 
+    # Pre-block embeddings (post-patch-embed + pos-embed), shape
+    # {1, num_patches, hidden_size}. Useful for isolating whether the
+    # divergence comes from the embedding stage or the transformer blocks.
+    pre_block = out.pre_block_embeddings
+
+    # Per-block hidden states (pre-merger, shape {1, num_patches, hidden_size}).
+    # The encoder appends one entry per block, so this tuple has num_blocks
+    # entries, indexed 0..num_blocks-1.
+    per_layer_hidden_states = Tuple.to_list(out.hidden_states)
+
+    # Prepend pre_block so our list matches PyTorch's hidden_states convention
+    # (entry 0 = pre-block, entry i = post-block-(i-1)).
+    full_layers = [pre_block | per_layer_hidden_states]
+
+    per_layer_mid_token_first3 =
+      Enum.map(full_layers, fn block_hs ->
+        {1, num_patches, _hidden} = Nx.shape(block_hs)
+        mid = div(num_patches, 2)
+        for k <- 0..2, do: block_hs[[0, mid, k]] |> Nx.to_number()
+      end)
+
     %{
       "shape" => Tuple.to_list(Nx.shape(hs)),
       "first_token" => hs[[0, 0, ..]] |> Nx.to_flat_list(),
       "mid_token" => hs[[0, div(n, 2), ..]] |> Nx.to_flat_list(),
-      "last_token" => hs[[0, n - 1, ..]] |> Nx.to_flat_list()
+      "last_token" => hs[[0, n - 1, ..]] |> Nx.to_flat_list(),
+      "per_layer_count" => length(full_layers),
+      "per_layer_mid_token_first3" => per_layer_mid_token_first3
     }
   end
 
@@ -312,6 +361,18 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
 
     Mix.shell().info("\nTop-10 ID agreement: #{matches} / 10")
 
+    # Pixel-values byte equality (sanity check the featurizer)
+    Mix.shell().info("\n=== Featurizer output sanity check ===")
+    bb_pv = bb["pixel_values_first_patch_first16"]
+    py_pv0 = py["pv_first_patch_first16"]
+    py_pv_mid = py["pv_mid_patch_first16"]
+    bb_pv_mid = bb["pixel_values_mid_patch_first16"]
+
+    pv_diff_0 = max_abs_diff(py_pv0, bb_pv, 16)
+    pv_diff_mid = max_abs_diff(py_pv_mid, bb_pv_mid, 16)
+    Mix.shell().info("first patch, first 16: max_abs_diff = #{Float.round(pv_diff_0, 6)}")
+    Mix.shell().info("mid patch,   first 16: max_abs_diff = #{Float.round(pv_diff_mid, 6)}")
+
     Mix.shell().info("\n=== Vision encoder output (post-merger visual embeddings) ===")
     Mix.shell().info("py shape: #{inspect(py["visual_shape"])}    bb shape: #{inspect(bb["visual"]["shape"])}")
 
@@ -331,6 +392,44 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
         "#{label}  max_abs=#{Float.round(max_diff, 6)}  mean_abs=#{Float.round(mean_diff, 6)}"
       )
     end
+
+    # Per-block hidden states. Python's tuple may include an extra
+    # initial entry (pre-block embeddings); align by trimming the
+    # leading mismatch.
+    py_per = py["per_layer_mid_token_first3"]
+    bb_per = bb["visual"]["per_layer_mid_token_first3"]
+
+    py_count = length(py_per)
+    bb_count = length(bb_per)
+
+    Mix.shell().info(
+      "\n=== Per-layer hidden state (mid token, first 3 dims) [py: #{py_count}, bb: #{bb_count}] ==="
+    )
+
+    Mix.shell().info("  index  label              py[0]      py[1]      py[2]      bb[0]      bb[1]      bb[2]      max_diff")
+
+    py_per
+    |> Enum.zip(bb_per)
+    |> Enum.with_index()
+    |> Enum.each(fn {{py3, bb3}, i} ->
+      diffs = Enum.zip(py3, bb3) |> Enum.map(fn {a, b} -> abs(a - b) end)
+      max_diff = Enum.max(diffs)
+
+      label =
+        case i do
+          0 -> "pre-block         "
+          n -> "after block #{lpad(n - 1, 2)}    "
+        end
+
+      cols =
+        Enum.map(py3, &Float.round(&1, 4)) ++ Enum.map(bb3, &Float.round(&1, 4))
+
+      Mix.shell().info(
+        "  #{lpad(i, 5)}  #{label}  " <>
+          (cols |> Enum.map(&lpad(&1, 9)) |> Enum.join("  ")) <>
+          "    #{Float.round(max_diff, 5)}"
+      )
+    end)
   end
 
   defp max_abs_diff(a, b, n) do

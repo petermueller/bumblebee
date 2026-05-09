@@ -174,61 +174,37 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
   defp core(inputs, spec) do
     pixel_values = inputs["pixel_values"]
 
-    # Patch embedding: Apply Conv3d equivalent on pre-extracted patches
-    # Python does: reshape {num_patches, 1536} -> {num_patches, C, T, H, W} -> Conv3d -> {num_patches, hidden_size}
     embeddings = patch_embedding(pixel_values, spec, name: "patch_embed")
-
-    # Add learned position embeddings
-    # Shape: {num_position_embeddings, hidden_size}
     embeddings = position_embedding(embeddings, spec, name: "pos_embed")
-
-    # Encoder with transformer blocks
-    encoder_outputs =
-      encoder(embeddings, spec, name: "blocks")
-
-    # Patch merger
-    hidden_state =
-      patch_merger(encoder_outputs.hidden_state, spec, name: "merger")
+    encoder_outputs = encoder(embeddings, spec, name: "blocks")
+    hidden_state = patch_merger(encoder_outputs.hidden_state, spec, name: "merger")
 
     %{
       hidden_state: hidden_state,
-      # Pre-block embeddings (post-patch-embed + post-pos-embed), exposed
-      # for debugging/comparison harnesses against the HF reference.
       pre_block_embeddings: embeddings,
       hidden_states: encoder_outputs.hidden_states,
       attentions: encoder_outputs.attentions,
-      # DeepStack features from intermediate layers
       deepstack_hidden_states: encoder_outputs.deepstack_hidden_states
     }
   end
 
+  # HF's patch embed is a Conv3d with kernel == stride == the full
+  # patch volume, which collapses to a per-patch dense projection. We
+  # keep the kernel param shape `{hidden, c, t, p_h, p_w}` to match
+  # the saved PyTorch weight layout, then unfold it into a matmul.
   defp patch_embedding(pixel_values, spec, opts) do
     name = opts[:name]
 
-    # Input shape: {num_patches, channels * temporal_patch_size * patch_size * patch_size}
-    # = {num_patches, 3 * 2 * 16 * 16} = {num_patches, 1536}
-    #
-    # Python PatchEmbed:
-    # 1. Reshapes to {num_patches, C, T, H, W} = {num_patches, 3, 2, 16, 16}
-    # 2. Applies Conv3d(3, 1024, kernel=(2,16,16), stride=(2,16,16))
-    # 3. Output: {num_patches, 1024, 1, 1, 1} -> flatten to {num_patches, 1024}
-    #
-    # Since Conv3d with kernel=stride=full_size is equivalent to a linear projection,
-    # we implement this as a dense layer.
-
-    # Reshape for proper 3D conv simulation
-    # {num_patches, 1536} -> {num_patches, 3, 2, 16, 16}
     reshaped =
       Axon.nx(pixel_values, fn x ->
         {num_patches, _flat} = Nx.shape(x)
-        channels = spec.num_channels
-        temporal = spec.temporal_patch_size
-        patch_h = spec.patch_size
-        patch_w = spec.patch_size
-        Nx.reshape(x, {num_patches, channels, temporal, patch_h, patch_w})
+        Nx.reshape(
+          x,
+          {num_patches, spec.num_channels, spec.temporal_patch_size, spec.patch_size,
+           spec.patch_size}
+        )
       end)
 
-    # Conv3d kernel param: {out_channels, in_channels, t, h, w}
     kernel_param =
       Axon.param(
         "kernel",
@@ -239,7 +215,6 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
         initializer: kernel_initializer(spec)
       )
 
-    # Conv3d bias param
     bias_param =
       Axon.param(
         "bias",
@@ -247,35 +222,21 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
         initializer: Axon.Initializers.zeros()
       )
 
-    # Apply Conv3d equivalent - since kernel covers entire input, it's like a dense layer
     Axon.layer(
       fn x, kernel, bias, _opts ->
-        # x: {num_patches, 3, 2, 16, 16}
-        # kernel: {hidden_size, 3, 2, 16, 16}
-        # bias: {hidden_size}
-        # Output: {num_patches, hidden_size}
         {num_patches, c, t, h, w} = Nx.shape(x)
         {hidden_size, _, _, _, _} = Nx.shape(kernel)
 
-        # Flatten spatial dims: {num_patches, c*t*h*w}
         x_flat = Nx.reshape(x, {num_patches, c * t * h * w})
-        # Flatten kernel: {hidden_size, c*t*h*w} -> transpose to {c*t*h*w, hidden_size}
-        k_flat = Nx.reshape(kernel, {hidden_size, c * t * h * w})
-        k_flat = Nx.transpose(k_flat)
+        k_flat = kernel |> Nx.reshape({hidden_size, c * t * h * w}) |> Nx.transpose()
 
-        # Matrix multiply: {num_patches, c*t*h*w} @ {c*t*h*w, hidden_size} = {num_patches, hidden_size}
-        result = Nx.dot(x_flat, k_flat)
-        # Add bias
-        Nx.add(result, bias)
+        x_flat |> Nx.dot(k_flat) |> Nx.add(bias)
       end,
       [reshaped, kernel_param, bias_param],
       name: join(name, "proj"),
       op_name: :conv3d
     )
-    |> Axon.nx(fn x ->
-      # Add batch dimension for transformer: {num_patches, hidden_size} -> {1, num_patches, hidden_size}
-      Nx.new_axis(x, 0)
-    end)
+    |> Axon.nx(&Nx.new_axis(&1, 0))
   end
 
   defp position_embedding(embeddings, spec, opts) do
@@ -578,37 +539,13 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
     }
   end
 
-  # DeepStack merger - uses postshuffle norm (norm AFTER spatial merge)
-  # This differs from main merger which uses norm BEFORE spatial merge
   defp deepstack_merger(hidden_state, spec, index, name) do
-    merger_name = join(name, index)
-
-    merge_size = spec.spatial_merge_size * spec.spatial_merge_size
-    mlp_input_size = spec.hidden_size * merge_size
-
-    hidden_state
-    # First, reshape to group spatial patches for merging (BEFORE norm).
-    # Patches arrive in HF's (h_block, w_block, m_h, m_w) order, so the
-    # 4 patches in each merge block are already consecutive in the
-    # patch dimension — flatten 4 at a time without a transpose.
-    |> Axon.nx(fn x ->
-      {batch, num_patches, hidden} = Nx.shape(x)
-      Nx.reshape(x, {batch, div(num_patches, merge_size), merge_size * hidden})
-    end)
-    # Layer norm on merged dimension (postshuffle_norm=True)
-    |> Axon.layer_norm(
-      epsilon: spec.layer_norm_epsilon,
-      name: join(merger_name, "norm")
-    )
-    # MLP: linear_fc1 -> activation -> linear_fc2
-    |> Axon.dense(mlp_input_size,
-      kernel_initializer: kernel_initializer(spec),
-      name: join(merger_name, "linear_fc1")
-    )
-    |> Layers.activation(spec.activation)
-    |> Axon.dense(spec.out_hidden_size,
-      kernel_initializer: kernel_initializer(spec),
-      name: join(merger_name, "linear_fc2")
+    spatial_merger(hidden_state, spec,
+      base_name: join(name, index),
+      norm_name: "norm",
+      mlp_fc1_name: "linear_fc1",
+      mlp_fc2_name: "linear_fc2",
+      norm_position: :post
     )
   end
 
@@ -739,36 +676,58 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
   end
 
   defp patch_merger(hidden_state, spec, opts) do
-    name = opts[:name]
+    spatial_merger(hidden_state, spec,
+      base_name: opts[:name],
+      norm_name: "ln_q",
+      mlp_fc1_name: "mlp.0",
+      mlp_fc2_name: "mlp.2",
+      norm_position: :pre
+    )
+  end
 
-    # Patch merger: layer norm -> spatial merge -> MLP projection
-    # Note: Layer norm is applied BEFORE spatial merge in Qwen2VL
+  # Shared spatial-merge head for both the main patch merger and the
+  # DeepStack mergers. Each merge block of `spatial_merge_size^2`
+  # consecutive patches gets flattened into one token, then projected
+  # through `linear_fc1 / activation / linear_fc2`. Patches arrive in
+  # HF's (h_block, w_block, m_h, m_w) order so the merge is a plain
+  # reshape — no transpose. Norm placement is the only thing that
+  # differs between the two callers (pre-merge for the main merger,
+  # post-merge for DeepStack).
+  defp spatial_merger(hidden_state, spec, opts) do
+    base_name = Keyword.fetch!(opts, :base_name)
+    norm_name = Keyword.fetch!(opts, :norm_name)
+    mlp_fc1_name = Keyword.fetch!(opts, :mlp_fc1_name)
+    mlp_fc2_name = Keyword.fetch!(opts, :mlp_fc2_name)
+    norm_position = Keyword.fetch!(opts, :norm_position)
+
     merge_size = spec.spatial_merge_size * spec.spatial_merge_size
     mlp_input_size = spec.hidden_size * merge_size
 
-    hidden_state
-    # Layer norm on hidden_size (before merging)
-    |> Axon.layer_norm(
-      epsilon: spec.layer_norm_epsilon,
-      name: join(name, "ln_q")
-    )
-    # Reshape to group spatial patches for merging.
-    # Patches arrive in HF's (h_block, w_block, m_h, m_w) order, so the
-    # 4 patches in each merge block are already consecutive — a simple
-    # reshape (no transpose) is enough.
-    |> Axon.nx(fn x ->
-      {batch, num_patches, hidden} = Nx.shape(x)
-      Nx.reshape(x, {batch, div(num_patches, merge_size), merge_size * hidden})
-    end)
-    # MLP: fc1 -> activation -> fc2
+    norm = fn x ->
+      Axon.layer_norm(x, epsilon: spec.layer_norm_epsilon, name: join(base_name, norm_name))
+    end
+
+    reshape =
+      &Axon.nx(&1, fn x ->
+        {batch, num_patches, hidden} = Nx.shape(x)
+        Nx.reshape(x, {batch, div(num_patches, merge_size), merge_size * hidden})
+      end)
+
+    merged =
+      case norm_position do
+        :pre -> hidden_state |> norm.() |> reshape.()
+        :post -> hidden_state |> reshape.() |> norm.()
+      end
+
+    merged
     |> Axon.dense(mlp_input_size,
       kernel_initializer: kernel_initializer(spec),
-      name: join(name, "mlp.0")
+      name: join(base_name, mlp_fc1_name)
     )
     |> Layers.activation(spec.activation)
     |> Axon.dense(spec.out_hidden_size,
       kernel_initializer: kernel_initializer(spec),
-      name: join(name, "mlp.2")
+      name: join(base_name, mlp_fc2_name)
     )
   end
 

@@ -200,24 +200,34 @@ defmodule Bumblebee.Multimodal.Qwen3VL do
 
   defp walk_position_ids(ids, img_id, gt, gh, gw, total, current_pos, acc) do
     # Head is image_token_id. The image must occupy `total` consecutive
-    # tokens; consume them as a block and emit (t, h, w) positions per the
-    # patch grid. After the block, text continues at
+    # tokens; emit (t, h, w) positions per the patch grid for the block,
+    # consume the block in one O(total) pass, then continue text at
     # current_pos + max(gh, gw) (HF's rule).
-    {image_run, rest_after_image} = Enum.split(ids, total)
-
-    if length(image_run) != total or Enum.any?(image_run, &(&1 != img_id)) do
-      raise ArgumentError,
-            "Expected #{total} consecutive image_token_id (#{img_id}) tokens at position " <>
-              "(post-#{length(acc)}), got a #{length(image_run)}-long run with mixed ids"
-    end
-
     triples =
       for i <- 0..(gt - 1), j <- 0..(gh - 1), k <- 0..(gw - 1) do
         {i + current_pos, j + current_pos, k + current_pos}
       end
 
+    rest_after_image = drop_image_run(ids, img_id, total, length(acc))
     next_pos = current_pos + max(gh, gw)
-    walk_position_ids(rest_after_image, img_id, gt, gh, gw, total, next_pos, Enum.reverse(triples) ++ acc)
+    walk_position_ids(rest_after_image, img_id, gt, gh, gw, total, next_pos,
+      Enum.reverse(triples) ++ acc)
+  end
+
+  defp drop_image_run([], _img_id, n, prefix_len) when n > 0 do
+    raise ArgumentError,
+          "Expected #{n} more consecutive image_token_id tokens at position #{prefix_len}, got end of input"
+  end
+
+  defp drop_image_run(rest, _img_id, 0, _prefix_len), do: rest
+
+  defp drop_image_run([id | _rest], img_id, _n, prefix_len) when id != img_id do
+    raise ArgumentError,
+          "Expected image_token_id (#{img_id}) at position #{prefix_len}, got #{id}"
+  end
+
+  defp drop_image_run([_id | rest], img_id, n, prefix_len) do
+    drop_image_run(rest, img_id, n - 1, prefix_len + 1)
   end
 
   @doc """
@@ -386,71 +396,45 @@ defmodule Bumblebee.Multimodal.Qwen3VL do
     Layers.if_present vision_hidden_state do
       Axon.layer(
         fn token_embeds, visual_embeds, input_ids, _opts ->
-          # Create mask for visual tokens
           image_mask = Nx.equal(input_ids, spec.image_token_id)
           video_mask = Nx.equal(input_ids, spec.video_token_id)
           visual_mask = Nx.logical_or(image_mask, video_mask)
-
-          # visual_embeds shape: {batch, num_visual_tokens, hidden_size}
-          # visual_mask shape: {batch, seq_len}
-          # This is a simplified substitution - a full implementation would need
-          # to handle variable numbers of visual tokens per sequence
           substitute_at_mask(token_embeds, visual_embeds, visual_mask)
         end,
         [token_embeddings, vision_hidden_state, input_ids]
       )
     else
-      # No visual input - just use token embeddings
       token_embeddings
     end
   end
 
-  # Substitute visual embeddings at positions where mask is true
+  # For each token whose `mask` is true, replace its embedding with the
+  # corresponding row of `visual_embeds`. Visual rows are assigned in
+  # left-to-right order via cumsum (so the i-th masked position picks
+  # the i-th visual embedding).
   defp substitute_at_mask(token_embeds, visual_embeds, mask) do
-    # token_embeds: {batch, seq_len, hidden}
-    # visual_embeds: {batch, num_visual, hidden}
-    # mask: {batch, seq_len} - boolean mask where image tokens are
     {batch_size, seq_len, hidden_size} = Nx.shape(token_embeds)
     {_, num_visual, _} = Nx.shape(visual_embeds)
 
-    # We need to scatter visual_embeds into positions where mask is true
-    # Create indices for where to place visual embeddings
-    # mask_indices gives us which positions in seq_len are image tokens
-
-    # Convert mask to indices - find positions where mask is true
-    # For each position in the sequence, if it's an image token,
-    # we need to know which visual embedding to use
-
-    # Create a cumulative sum of the mask to get visual embedding indices
-    # mask: [0, 0, 1, 1, 1, 0, 0] -> cumsum: [0, 0, 1, 2, 3, 3, 3]
-    # Then subtract 1 where mask is true to get 0-indexed: [-, -, 0, 1, 2, -, -]
-    mask_int = Nx.as_type(mask, :s32)
-    cumsum = Nx.cumulative_sum(mask_int, axis: 1)
-    # visual_indices gives the index into visual_embeds for each position
-    # For non-image positions, this will be garbage but we'll mask it out
-    visual_indices = Nx.subtract(cumsum, 1)
-    # Clamp to valid range
-    visual_indices = Nx.clip(visual_indices, 0, num_visual - 1)
-
-    # Gather visual embeddings according to indices
-    # visual_indices shape: {batch, seq_len}
-    # We need to gather from visual_embeds {batch, num_visual, hidden}
-    # Result should be {batch, seq_len, hidden}
-
-    # Expand indices to match hidden dimension for gathering
-    # {batch, seq_len} -> {batch, seq_len, hidden}
-    visual_indices_expanded = Nx.new_axis(visual_indices, -1)
+    visual_indices =
+      mask
+      |> Nx.as_type(:s32)
+      |> Nx.cumulative_sum(axis: 1)
+      |> Nx.subtract(1)
+      |> Nx.clip(0, num_visual - 1)
 
     visual_indices_expanded =
-      Nx.broadcast(visual_indices_expanded, {batch_size, seq_len, hidden_size})
+      visual_indices
+      |> Nx.new_axis(-1)
+      |> Nx.broadcast({batch_size, seq_len, hidden_size})
 
     visual_gathered = Nx.take_along_axis(visual_embeds, visual_indices_expanded, axis: 1)
 
-    # Expand mask for broadcasting with hidden dimension
-    mask_expanded = Nx.new_axis(mask, -1)
-    mask_expanded = Nx.broadcast(mask_expanded, {batch_size, seq_len, hidden_size})
+    mask_expanded =
+      mask
+      |> Nx.new_axis(-1)
+      |> Nx.broadcast({batch_size, seq_len, hidden_size})
 
-    # Select: where mask is true, use visual; else use token
     Nx.select(mask_expanded, visual_gathered, token_embeds)
   end
 
