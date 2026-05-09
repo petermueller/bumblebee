@@ -232,18 +232,26 @@ defmodule Bumblebee.Vision.Qwen3VLFeaturizer do
     patches_w = div(width, patch_size)
     patches_t = div(temporal, temporal_patch_size)
 
-    # Reshape to extract patches
-    # {batch, temporal, height, width, channels}
-    # -> {batch, patches_t, temporal_patch_size, patches_h, patch_size, patches_w, patch_size, channels}
+    merge = featurizer.merge_size
+    h_block = div(patches_h, merge)
+    w_block = div(patches_w, merge)
+
+    # Reshape and reorder to match HuggingFace's Qwen2VLImageProcessor
+    # patch ordering. Patches are grouped by `merge_size`x`merge_size`
+    # spatial blocks so the downstream patch merger becomes a trivial
+    # reshape (and so the loaded vision-encoder weights, which were
+    # trained against this ordering, behave correctly).
+    #
+    # Input: {batch, temporal, height, width, channels}
+    # Factor (height, width) into (h_block, m_h, p) and (w_block, m_w, p):
     images =
       images
       |> Nx.reshape(
-        {batch, patches_t, temporal_patch_size, patches_h, patch_size, patches_w, patch_size,
-         channels}
+        {batch, temporal, h_block, merge, patch_size, w_block, merge, patch_size, channels}
       )
-      # Reorder for Python format: patches, then [channels, temporal, h, w]
-      # -> {batch, patches_t, patches_h, patches_w, channels, temporal_patch_size, patch_size, patch_size}
-      |> Nx.transpose(axes: [0, 1, 3, 5, 7, 2, 4, 6])
+      # Permute to Python's order:
+      # (batch, h_block, w_block, m_h, m_w, channels, temporal, p_h, p_w)
+      |> Nx.transpose(axes: [0, 2, 5, 3, 6, 8, 1, 4, 7])
       # Flatten patches: {batch, num_patches, channels * temporal * patch_h * patch_w}
       |> Nx.reshape(
         {batch, patches_t * patches_h * patches_w,

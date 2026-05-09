@@ -192,6 +192,9 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
 
     %{
       hidden_state: hidden_state,
+      # Pre-block embeddings (post-patch-embed + post-pos-embed), exposed
+      # for debugging/comparison harnesses against the HF reference.
+      pre_block_embeddings: embeddings,
       hidden_states: encoder_outputs.hidden_states,
       attentions: encoder_outputs.attentions,
       # DeepStack features from intermediate layers
@@ -362,8 +365,9 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
 
         w_cc = Nx.multiply(dh_2d, dw_2d) |> Nx.flatten() |> Nx.reshape({num_patches, 1})
 
-        # Weighted sum for interpolated embeddings
-        interpolated =
+        # Weighted sum for interpolated embeddings (in raster (row, col) order
+        # over the grid_h * grid_w grid).
+        interpolated_raster =
           Nx.add(
             Nx.add(
               Nx.multiply(emb_ff, w_ff),
@@ -374,6 +378,20 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
               Nx.multiply(emb_cc, w_cc)
             )
           )
+
+        # Reorder from raster (row, col) ordering to the merge-block-grouped
+        # (h_block, w_block, m_h, m_w) ordering used by the featurizer / HF.
+        # Match HF's `.view(h/m, m, w/m, m, -1).permute(0, 2, 1, 3, 4).flatten`.
+        merge = spec.spatial_merge_size
+        h_block_count = div(grid_h, merge)
+        w_block_count = div(grid_w, merge)
+        hidden_size = spec.hidden_size
+
+        interpolated =
+          interpolated_raster
+          |> Nx.reshape({h_block_count, merge, w_block_count, merge, hidden_size})
+          |> Nx.transpose(axes: [0, 2, 1, 3, 4])
+          |> Nx.reshape({num_patches, hidden_size})
 
         # Add to embeddings (broadcast to batch dimension)
         Nx.add(embed, interpolated)
@@ -414,7 +432,13 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
         head_dim = div(spec.hidden_size, spec.num_attention_heads)
         rotary_dim = div(head_dim, 2)
 
-        compute_2d_rotary_embedding(seq_len, grid_w, rotary_dim, spec.rotary_embedding_base)
+        compute_2d_rotary_embedding(
+          seq_len,
+          grid_w,
+          spec.spatial_merge_size,
+          rotary_dim,
+          spec.rotary_embedding_base
+        )
       end)
 
     # Use custom transformer blocks with 2D rotary embedding
@@ -424,14 +448,32 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
   end
 
   # Compute 2D rotary embedding (cos, sin) for vision patches.
-  # `grid_w` is the column count of the patch grid; rows are derived as
-  # `position div grid_w`, columns as `position rem grid_w`.
+  #
+  # Patches are stored in HF's merge-block-grouped order:
+  # for an index `i`, decompose as (h_block, w_block, m_h, m_w) with
+  #   h_block = i / (w_block_count * merge * merge)
+  #   w_block = (i / (merge * merge)) rem w_block_count
+  #   m_h     = (i / merge) rem merge
+  #   m_w     = i rem merge
+  # then row = h_block * merge + m_h, col = w_block * merge + m_w.
+  #
   # Returns {cos, sin} each of shape {seq_len, rotary_dim}.
-  defnp compute_2d_rotary_embedding(seq_len, grid_w, rotary_dim, base) do
-    # For each patch in raster scan order, compute (row, col) position
+  defnp compute_2d_rotary_embedding(seq_len, grid_w, merge, rotary_dim, base) do
+    # Walk patches in HF's order; recover (row, col) per index.
     positions = Nx.iota({seq_len})
-    row_positions = Nx.quotient(positions, grid_w)
-    col_positions = Nx.remainder(positions, grid_w)
+    w_block_count = div(grid_w, merge)
+    block_size = merge * merge
+    row_block_size = w_block_count * block_size
+
+    h_block = Nx.quotient(positions, row_block_size)
+    rem1 = Nx.remainder(positions, row_block_size)
+    w_block = Nx.quotient(rem1, block_size)
+    rem2 = Nx.remainder(rem1, block_size)
+    m_h = Nx.quotient(rem2, merge)
+    m_w = Nx.remainder(rem2, merge)
+
+    row_positions = h_block * merge + m_h
+    col_positions = w_block * merge + m_w
 
     # Compute inverse frequencies (half rotary_dim because we split for row/col)
     half_rotary_dim = div(rotary_dim, 2)
@@ -545,28 +587,13 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
     mlp_input_size = spec.hidden_size * merge_size
 
     hidden_state
-    # First, reshape to group spatial patches for merging (BEFORE norm)
+    # First, reshape to group spatial patches for merging (BEFORE norm).
+    # Patches arrive in HF's (h_block, w_block, m_h, m_w) order, so the
+    # 4 patches in each merge block are already consecutive in the
+    # patch dimension — flatten 4 at a time without a transpose.
     |> Axon.nx(fn x ->
       {batch, num_patches, hidden} = Nx.shape(x)
-
-      {grid_h, grid_w} =
-        case {spec.grid_h, spec.grid_w} do
-          {h, w} when is_integer(h) and is_integer(w) -> {h, w}
-          _ ->
-            s = trunc(:math.sqrt(num_patches))
-            {s, s}
-        end
-
-      merged_h = div(grid_h, spec.spatial_merge_size)
-      merged_w = div(grid_w, spec.spatial_merge_size)
-
-      # Reshape and merge spatial patches
-      x
-      |> Nx.reshape(
-        {batch, merged_h, spec.spatial_merge_size, merged_w, spec.spatial_merge_size, hidden}
-      )
-      |> Nx.transpose(axes: [0, 1, 3, 2, 4, 5])
-      |> Nx.reshape({batch, merged_h * merged_w, merge_size * hidden})
+      Nx.reshape(x, {batch, div(num_patches, merge_size), merge_size * hidden})
     end)
     # Layer norm on merged dimension (postshuffle_norm=True)
     |> Axon.layer_norm(
@@ -678,39 +705,28 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
     {output, weights}
   end
 
-  # Apply 2D rotary embedding to query and key
-  # cos, sin: {seq_len, rotary_dim}
-  # query, key: {batch, heads, seq_len, head_dim}
+  # Apply 2D rotary embedding to query and key.
+  #
+  # cos, sin shape: {seq_len, head_dim/2} = `[row_freqs..., col_freqs...]`
+  # query, key shape: {batch, heads, seq_len, head_dim}
+  #
+  # Matches HF's apply_rotary_pos_emb_vision: rotates the FULL head_dim
+  # (after duplicating cos/sin to head_dim length) with rotate_half pairing
+  # (k, k+head_dim/2). The duplication keeps rows paired with rows and cols
+  # with cols across the rotation.
   defnp apply_2d_rotary_embedding(query, key, cos, sin) do
-    # Rotary embedding only applies to first half of head_dim
-    {_batch, _heads, _seq, head_dim} = Nx.shape(query)
-    rotary_dim = div(head_dim, 2)
+    # Duplicate along the freq axis so cos/sin span the full head_dim.
+    cos_full = Nx.concatenate([cos, cos], axis: -1)
+    sin_full = Nx.concatenate([sin, sin], axis: -1)
 
-    # Split query/key into rotary and non-rotary parts
-    {q_rot, q_pass} = split_rotary(query, rotary_dim)
-    {k_rot, k_pass} = split_rotary(key, rotary_dim)
+    # Broadcast over batch and heads: {1, 1, seq_len, head_dim}
+    cos_full = cos_full |> Nx.new_axis(0) |> Nx.new_axis(0)
+    sin_full = sin_full |> Nx.new_axis(0) |> Nx.new_axis(0)
 
-    # Expand cos/sin for broadcasting: {1, 1, seq_len, rotary_dim}
-    cos = cos |> Nx.new_axis(0) |> Nx.new_axis(0)
-    sin = sin |> Nx.new_axis(0) |> Nx.new_axis(0)
-
-    # Apply rotary embedding
-    q_embed = q_rot * cos + rotate_half(q_rot) * sin
-    k_embed = k_rot * cos + rotate_half(k_rot) * sin
-
-    # Concatenate back
-    rotated_q = Nx.concatenate([q_embed, q_pass], axis: -1)
-    rotated_k = Nx.concatenate([k_embed, k_pass], axis: -1)
+    rotated_q = query * cos_full + rotate_half(query) * sin_full
+    rotated_k = key * cos_full + rotate_half(key) * sin_full
 
     {rotated_q, rotated_k}
-  end
-
-  defnp split_rotary(tensor, rotary_dim) do
-    {batch, heads, seq, head_dim} = Nx.shape(tensor)
-    pass_dim = head_dim - rotary_dim
-    rotary_part = Nx.slice(tensor, [0, 0, 0, 0], [batch, heads, seq, rotary_dim])
-    pass_part = Nx.slice(tensor, [0, 0, 0, rotary_dim], [batch, heads, seq, pass_dim])
-    {rotary_part, pass_part}
   end
 
   defnp rotate_half(x) do
@@ -736,28 +752,13 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
       epsilon: spec.layer_norm_epsilon,
       name: join(name, "ln_q")
     )
-    # Reshape to group spatial patches for merging
+    # Reshape to group spatial patches for merging.
+    # Patches arrive in HF's (h_block, w_block, m_h, m_w) order, so the
+    # 4 patches in each merge block are already consecutive — a simple
+    # reshape (no transpose) is enough.
     |> Axon.nx(fn x ->
       {batch, num_patches, hidden} = Nx.shape(x)
-
-      {grid_h, grid_w} =
-        case {spec.grid_h, spec.grid_w} do
-          {h, w} when is_integer(h) and is_integer(w) -> {h, w}
-          _ ->
-            s = trunc(:math.sqrt(num_patches))
-            {s, s}
-        end
-
-      merged_h = div(grid_h, spec.spatial_merge_size)
-      merged_w = div(grid_w, spec.spatial_merge_size)
-
-      # Reshape and merge spatial patches
-      x
-      |> Nx.reshape(
-        {batch, merged_h, spec.spatial_merge_size, merged_w, spec.spatial_merge_size, hidden}
-      )
-      |> Nx.transpose(axes: [0, 1, 3, 2, 4, 5])
-      |> Nx.reshape({batch, merged_h * merged_w, merge_size * hidden})
+      Nx.reshape(x, {batch, div(num_patches, merge_size), merge_size * hidden})
     end)
     # MLP: fc1 -> activation -> fc2
     |> Axon.dense(mlp_input_size,
