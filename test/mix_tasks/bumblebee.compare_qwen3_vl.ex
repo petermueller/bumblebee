@@ -120,6 +120,17 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
     )
 
     with torch.no_grad():
+        # Vision-only output (post-merger visual embeddings) for an
+        # apples-to-apples comparison against Bumblebee's vision encoder.
+        image_features = model.model.get_image_features(
+            pixel_values=inputs["pixel_values"],
+            image_grid_thw=inputs["image_grid_thw"],
+        )
+        # get_image_features returns a BaseModelOutputWithPooling whose
+        # `pooler_output` is a tuple of post-merger embeddings, one per
+        # image. We pass a single image, so take element 0.
+        visual = image_features.pooler_output[0]
+
         out = model(**inputs, use_cache=False)
 
     logits = out.logits
@@ -136,6 +147,10 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
         "logits_last_first_n": logits[0, -1, :128].tolist(),
         "top10_ids": top10.indices[0].tolist(),
         "top10_vals": top10.values[0].tolist(),
+        "visual_shape": list(visual.shape),
+        "visual_first_token": visual[0, :].tolist(),
+        "visual_last_token": visual[-1, :].tolist(),
+        "visual_mid_token": visual[visual.shape[0] // 2, :].tolist(),
     }
     """
 
@@ -208,12 +223,54 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
     last = outputs.logits[[.., -1, ..]]
     {top10_vals, top10_ids} = Nx.top_k(last, k: 10)
 
+    # Also run the vision encoder on its own, to compare its output to
+    # PyTorch's get_image_features(...). Lets us isolate whether logit
+    # drift is rooted in the vision tower vs downstream processing.
+    visual = run_vision_only(model_info, image_inputs["pixel_values"])
+
     %{
       "tokenizer" => tokenizer,
       "logits_step0_first_n" => outputs.logits[[.., 0, 0..127]] |> Nx.to_flat_list(),
       "logits_last_first_n" => outputs.logits[[.., -1, 0..127]] |> Nx.to_flat_list(),
       "top10_ids" => Nx.to_list(top10_ids[[0, ..]]),
-      "top10_vals" => Nx.to_list(top10_vals[[0, ..]])
+      "top10_vals" => Nx.to_list(top10_vals[[0, ..]]),
+      "visual" => visual
+    }
+  end
+
+  # Build the vision encoder standalone and run it with the vision
+  # subset of the loaded multimodal params. Returns three sample rows
+  # of the post-merger visual embeddings (first / middle / last token).
+  defp run_vision_only(model_info, pixel_values) do
+    vision_spec = model_info.spec.vision_spec
+    vision_model = vision_spec.__struct__.model(vision_spec)
+
+    %Axon.ModelState{data: data} = model_info.params
+    prefix = "vision_model."
+
+    vision_data =
+      for {k, v} <- data, String.starts_with?(k, prefix), into: %{} do
+        {String.replace_prefix(k, prefix, ""), v}
+      end
+
+    vision_params = %Axon.ModelState{
+      data: vision_data,
+      parameters: vision_data |> Map.new(fn {k, v} -> {k, Map.keys(v)} end),
+      state: %{},
+      frozen_parameters: %{}
+    }
+
+    out = Axon.predict(vision_model, vision_params, %{"pixel_values" => pixel_values})
+
+    # out.hidden_state shape: {1, num_visual_tokens, out_hidden_size}
+    hs = out.hidden_state
+    {1, n, _hs} = Nx.shape(hs)
+
+    %{
+      "shape" => Tuple.to_list(Nx.shape(hs)),
+      "first_token" => hs[[0, 0, ..]] |> Nx.to_flat_list(),
+      "mid_token" => hs[[0, div(n, 2), ..]] |> Nx.to_flat_list(),
+      "last_token" => hs[[0, n - 1, ..]] |> Nx.to_flat_list()
     }
   end
 
@@ -254,6 +311,26 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
       |> Enum.count(fn {a, b} -> a == b end)
 
     Mix.shell().info("\nTop-10 ID agreement: #{matches} / 10")
+
+    Mix.shell().info("\n=== Vision encoder output (post-merger visual embeddings) ===")
+    Mix.shell().info("py shape: #{inspect(py["visual_shape"])}    bb shape: #{inspect(bb["visual"]["shape"])}")
+
+    for {label, py_key, bb_key} <- [
+          {"first token", "visual_first_token", "first_token"},
+          {"mid token  ", "visual_mid_token", "mid_token"},
+          {"last token ", "visual_last_token", "last_token"}
+        ] do
+      py_vec = py[py_key]
+      bb_vec = bb["visual"][bb_key]
+
+      diffs = Enum.zip(py_vec, bb_vec) |> Enum.map(fn {a, b} -> abs(a - b) end)
+      max_diff = Enum.max(diffs)
+      mean_diff = Enum.sum(diffs) / length(diffs)
+
+      Mix.shell().info(
+        "#{label}  max_abs=#{Float.round(max_diff, 6)}  mean_abs=#{Float.round(mean_diff, 6)}"
+      )
+    end
   end
 
   defp max_abs_diff(a, b, n) do
