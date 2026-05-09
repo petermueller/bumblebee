@@ -366,11 +366,9 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
   defp encoder(embeddings, spec, opts) do
     name = opts[:name]
 
-    # Convert deepstack indexes to 0-indexed
-    deepstack_indexes =
-      spec.deepstack_visual_indexes
-      |> Enum.map(&(&1 - 1))
-      |> MapSet.new()
+    # `deepstack_visual_indexes` is 0-indexed in HF (it's compared against
+    # `enumerate(self.blocks)`), so use the values as-is.
+    deepstack_indexes = MapSet.new(spec.deepstack_visual_indexes)
 
     # Qwen3-VL uses 2D spatial rotary embeddings where each patch has (row, col) position.
     # Python's rot_pos_emb computes row and col frequencies separately, then concatenates them.
