@@ -134,9 +134,18 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
         per_layer_hidden = [hs.detach().cpu().tolist() for hs in vision_output.hidden_states]
         visual = vision_output.pooler_output
 
-        out = model(**inputs, use_cache=False)
+        out = model(**inputs, use_cache=False, output_hidden_states=True)
 
     logits = out.logits
+    text_hidden_states = out.hidden_states  # tuple, one per text block (+ embedding entry)
+
+    # Compute the 3-axis position_ids HF uses internally so we can verify
+    # Bumblebee's `position_ids/3` matches.
+    _ids = inputs["input_ids"]
+    _mm_type = ((_ids == 151655).int() + (_ids == 151656).int() * 2)
+    _pos_ids, _ = model.model.get_rope_index(_ids, _mm_type, image_grid_thw=inputs["image_grid_thw"])
+    if _pos_ids.ndim == 2:
+        _pos_ids = _pos_ids[None, ...].expand(3, _pos_ids.shape[0], -1)
 
     last = logits[:, -1, :]
     top10 = torch.topk(last, k=10, dim=-1)
@@ -159,12 +168,34 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
         "pv_mid_patch_first16": inputs["pixel_values"][inputs["pixel_values"].shape[0] // 2, :16].tolist(),
         "per_layer_hidden_count": len(per_layer_hidden),
         "per_layer_hidden_shape": list(vision_output.hidden_states[0].shape),
-        # First three components of one mid token, per layer, for compact
-        # dumping. Lets us track where the divergence first appears.
         "per_layer_mid_token_first3": [
             [hs[hs.shape[0] // 2, k].item() for k in range(3)]
             for hs in vision_output.hidden_states
         ],
+        # Text-decoder per-block hidden states. shape (1, seq, hidden).
+        # We sample the LAST token's first 3 dims so we can spot exactly
+        # which block first diverges from the reference.
+        "text_per_block_count": len(text_hidden_states),
+        "text_per_block_last_token_first3": [
+            [hs[0, -1, k].item() for k in range(3)]
+            for hs in text_hidden_states
+        ],
+        # Also sample a visual-position (mid-visual, around index 150).
+        "text_per_block_mid_visual_first3": [
+            [hs[0, 150, k].item() for k in range(3)]
+            for hs in text_hidden_states
+        ],
+        # Early text token (idx 2, before the image block). Causal
+        # attention means this token only sees positions 0-2, none of
+        # which are visual — so it isolates per-block math from any
+        # cross-modal effect.
+        "text_per_block_early_text_first3": [
+            [hs[0, 2, k].item() for k in range(3)]
+            for hs in text_hidden_states
+        ],
+        "text_total_count_with_embedding": len(text_hidden_states),
+        "position_ids_head": _pos_ids[:, 0, :8].tolist(),
+        "position_ids_tail": _pos_ids[:, 0, -8:].tolist(),
     }
     """
 
@@ -232,10 +263,38 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
         Map.put(base_inputs, "position_ids", position_ids)
       end
 
-    outputs = Axon.predict(model_info.model, model_info.params, inputs)
+    outputs =
+      Axon.predict(model_info.model, model_info.params, inputs,
+        global_layer_options: [output_hidden_states: true]
+      )
 
     last = outputs.logits[[.., -1, ..]]
     {top10_vals, top10_ids} = Nx.top_k(last, k: 10)
+
+    # Per-text-block hidden states (last token, first 3 dims). One entry
+    # per decoder block, plus a final post-norm entry that the multimodal
+    # model appends — so length matches PyTorch's tuple of (per-block + final).
+    text_per_block_last_token_first3 =
+      outputs.hidden_states
+      |> Tuple.to_list()
+      |> Enum.map(fn hs ->
+        for k <- 0..2, do: hs[[0, -1, k]] |> Nx.to_number()
+      end)
+
+    text_per_block_mid_visual_first3 =
+      outputs.hidden_states
+      |> Tuple.to_list()
+      |> Enum.map(fn hs ->
+        for k <- 0..2, do: hs[[0, 150, k]] |> Nx.to_number()
+      end)
+
+    text_per_block_early_text_first3 =
+      outputs.hidden_states
+      |> Tuple.to_list()
+      |> Enum.map(fn hs ->
+        for k <- 0..2, do: hs[[0, 2, k]] |> Nx.to_number()
+      end)
+
 
     # Also run the vision encoder on its own, to compare its output to
     # PyTorch's get_image_features(...). Lets us isolate whether logit
@@ -247,6 +306,16 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
     pv_first16 = pv[[0, 0..15]] |> Nx.to_flat_list()
     pv_mid16 = pv[[div(npp, 2), 0..15]] |> Nx.to_flat_list()
 
+    pos_ids_head =
+      if no_mrope?,
+        do: nil,
+        else: position_ids_sample(inputs["position_ids"], 0..7)
+
+    pos_ids_tail =
+      if no_mrope?,
+        do: nil,
+        else: position_ids_sample(inputs["position_ids"], -8..-1)
+
     %{
       "tokenizer" => tokenizer,
       "logits_step0_first_n" => outputs.logits[[.., 0, 0..127]] |> Nx.to_flat_list(),
@@ -255,8 +324,19 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
       "top10_vals" => Nx.to_list(top10_vals[[0, ..]]),
       "visual" => visual,
       "pixel_values_first_patch_first16" => pv_first16,
-      "pixel_values_mid_patch_first16" => pv_mid16
+      "pixel_values_mid_patch_first16" => pv_mid16,
+      "text_per_block_last_token_first3" => text_per_block_last_token_first3,
+      "text_per_block_mid_visual_first3" => text_per_block_mid_visual_first3,
+      "text_per_block_early_text_first3" => text_per_block_early_text_first3,
+      "position_ids_head" => pos_ids_head,
+      "position_ids_tail" => pos_ids_tail
     }
+  end
+
+  defp position_ids_sample(position_ids, range) do
+    for axis <- 0..2 do
+      Nx.to_list(position_ids[[axis, 0, range]])
+    end
   end
 
   # Build the vision encoder standalone and run it with the vision
@@ -361,6 +441,13 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
 
     Mix.shell().info("\nTop-10 ID agreement: #{matches} / 10")
 
+    if bb["position_ids_head"] do
+      Mix.shell().info("\n=== position_ids head (first 8 tokens) ===")
+      print_position_ids_table(py["position_ids_head"], bb["position_ids_head"])
+      Mix.shell().info("\n=== position_ids tail (last 8 tokens) ===")
+      print_position_ids_table(py["position_ids_tail"], bb["position_ids_tail"])
+    end
+
     # Pixel-values byte equality (sanity check the featurizer)
     Mix.shell().info("\n=== Featurizer output sanity check ===")
     bb_pv = bb["pixel_values_first_patch_first16"]
@@ -430,6 +517,45 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
           "    #{Float.round(max_diff, 5)}"
       )
     end)
+
+    # Text-decoder per-block hidden state. Both PyTorch and Bumblebee
+    # start with the pre-block embedding; Bumblebee additionally appends
+    # the post-final-norm entry. Drop both leading entries to align so
+    # each row compares post-block-i for i = 0..N-1.
+    print_text_block_table = fn label, py_key, bb_key ->
+      py_rows = py[py_key] |> tl()
+      bb_rows = bb[bb_key] |> tl() |> Enum.take(length(py_rows))
+
+      Mix.shell().info(
+        "\n=== Text decoder per-block (#{label}, first 3 dims) [py: #{length(py_rows)}, bb: #{length(bb_rows)}] ==="
+      )
+
+      Mix.shell().info("  block   py[0]      py[1]      py[2]      bb[0]      bb[1]      bb[2]      max_diff")
+
+      py_rows
+      |> Enum.zip(bb_rows)
+      |> Enum.with_index()
+      |> Enum.each(fn {{py3, bb3}, i} ->
+        diffs = Enum.zip(py3, bb3) |> Enum.map(fn {a, b} -> abs(a - b) end)
+        max_diff = Enum.max(diffs)
+        cols = Enum.map(py3, &Float.round(&1, 4)) ++ Enum.map(bb3, &Float.round(&1, 4))
+
+        Mix.shell().info(
+          "  #{lpad(i, 5)}  " <>
+            (cols |> Enum.map(&lpad(&1, 9)) |> Enum.join("  ")) <>
+            "    #{Float.round(max_diff, 5)}"
+        )
+      end)
+    end
+
+    print_text_block_table.("last token (text)", "text_per_block_last_token_first3",
+      "text_per_block_last_token_first3")
+
+    print_text_block_table.("mid visual (idx 150)", "text_per_block_mid_visual_first3",
+      "text_per_block_mid_visual_first3")
+
+    print_text_block_table.("early text (idx 2)", "text_per_block_early_text_first3",
+      "text_per_block_early_text_first3")
   end
 
   defp max_abs_diff(a, b, n) do
@@ -442,5 +568,19 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
 
   defp lpad(value, n) do
     value |> to_string() |> String.pad_leading(n)
+  end
+
+  defp print_position_ids_table(py_axes, bb_axes) do
+    Mix.shell().info("  axis  py                                              bb")
+
+    for {label, axis} <- [{"t", 0}, {"h", 1}, {"w", 2}] do
+      py_row = Enum.at(py_axes, axis)
+      bb_row = Enum.at(bb_axes, axis)
+      match = if py_row == bb_row, do: "=", else: "≠"
+
+      Mix.shell().info(
+        "  #{label}    #{inspect(py_row) |> String.pad_trailing(46)}  #{inspect(bb_row)}   #{match}"
+      )
+    end
   end
 end

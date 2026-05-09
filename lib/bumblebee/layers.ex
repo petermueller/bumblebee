@@ -1499,7 +1499,10 @@ defmodule Bumblebee.Layers do
     sin_half = sin_t * t_mask + sin_h * h_mask + sin_w * w_mask
 
     # Re-double to full size by concatenating the half with itself along
-    # the last axis, matching positions_cos_sin's layout.
+    # the last axis, matching positions_cos_sin's layout. Insert a heads
+    # axis at position 2 so the result broadcasts against query/key
+    # shaped (batch, seq, heads, head_dim) — same layout as the standard
+    # 1D path's `Nx.new_axis(_, 2)`.
     cos = Nx.concatenate([cos_half, cos_half], axis: -1) |> Nx.new_axis(2) |> Nx.as_type(Nx.type(query))
     sin = Nx.concatenate([sin_half, sin_half], axis: -1) |> Nx.new_axis(2) |> Nx.as_type(Nx.type(query))
 
