@@ -196,6 +196,19 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
         "text_total_count_with_embedding": len(text_hidden_states),
         "position_ids_head": _pos_ids[:, 0, :8].tolist(),
         "position_ids_tail": _pos_ids[:, 0, -8:].tolist(),
+        # Pre-block hidden state, full vectors at a few sampled positions.
+        # Used for full-dim max_abs comparison vs Bumblebee.
+        "text_pre_block_full": {
+            "early_text_2": text_hidden_states[0][0, 2, :].tolist(),
+            "mid_visual_150": text_hidden_states[0][0, 150, :].tolist(),
+            "last": text_hidden_states[0][0, -1, :].tolist(),
+        },
+        # Post-block-0 hidden state, full vectors at the same positions.
+        "text_post_block_0_full": {
+            "early_text_2": text_hidden_states[1][0, 2, :].tolist(),
+            "mid_visual_150": text_hidden_states[1][0, 150, :].tolist(),
+            "last": text_hidden_states[1][0, -1, :].tolist(),
+        },
     }
     """
 
@@ -295,6 +308,20 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
         for k <- 0..2, do: hs[[0, 2, k]] |> Nx.to_number()
       end)
 
+    [pre_block | rest_blocks] = Tuple.to_list(outputs.hidden_states)
+    [post_block_0 | _] = rest_blocks
+
+    text_pre_block_full = %{
+      "early_text_2" => pre_block[[0, 2, ..]] |> Nx.to_flat_list(),
+      "mid_visual_150" => pre_block[[0, 150, ..]] |> Nx.to_flat_list(),
+      "last" => pre_block[[0, -1, ..]] |> Nx.to_flat_list()
+    }
+
+    text_post_block_0_full = %{
+      "early_text_2" => post_block_0[[0, 2, ..]] |> Nx.to_flat_list(),
+      "mid_visual_150" => post_block_0[[0, 150, ..]] |> Nx.to_flat_list(),
+      "last" => post_block_0[[0, -1, ..]] |> Nx.to_flat_list()
+    }
 
     # Also run the vision encoder on its own, to compare its output to
     # PyTorch's get_image_features(...). Lets us isolate whether logit
@@ -328,6 +355,8 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
       "text_per_block_last_token_first3" => text_per_block_last_token_first3,
       "text_per_block_mid_visual_first3" => text_per_block_mid_visual_first3,
       "text_per_block_early_text_first3" => text_per_block_early_text_first3,
+      "text_pre_block_full" => text_pre_block_full,
+      "text_post_block_0_full" => text_post_block_0_full,
       "position_ids_head" => pos_ids_head,
       "position_ids_tail" => pos_ids_tail
     }
@@ -518,16 +547,28 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
       )
     end)
 
-    # Text-decoder per-block hidden state. Both PyTorch and Bumblebee
-    # start with the pre-block embedding; Bumblebee additionally appends
-    # the post-final-norm entry. Drop both leading entries to align so
-    # each row compares post-block-i for i = 0..N-1.
+    # Text-decoder per-block hidden state. The two stacks use different
+    # output_hidden_states conventions:
+    #   HF: [input, post-0, post-1, ..., post-(N-2), post-norm]    length N+1
+    #   BB: [input, post-0, post-1, ..., post-(N-1), post-norm]    length N+2
+    # HF records the pre-block state for each layer (= post-state of the
+    # previous layer) plus a final post-norm, so it never explicitly
+    # records the last block's pre-norm output. Drop the leading input
+    # from both, and drop bb's extra post-(N-1) entry, so each row
+    # compares post-block-i for i = 0..N-2; the last row compares
+    # post-final-norm.
     print_text_block_table = fn label, py_key, bb_key ->
-      py_rows = py[py_key] |> tl()
-      bb_rows = bb[bb_key] |> tl() |> Enum.take(length(py_rows))
+      [py_pre | py_rest] = py[py_key]
+      [bb_pre | bb_rest] = bb[bb_key]
+      {bb_init, [_post_last_block, bb_post_norm]} = Enum.split(bb_rest, -2)
+
+      py_rows = [py_pre] ++ py_rest
+      bb_rows = [bb_pre] ++ bb_init ++ [bb_post_norm]
+
+      n = length(py_rows)
 
       Mix.shell().info(
-        "\n=== Text decoder per-block (#{label}, first 3 dims) [py: #{length(py_rows)}, bb: #{length(bb_rows)}] ==="
+        "\n=== Text decoder per-block (#{label}, first 3 dims) [py: #{n}, bb: #{length(bb_rows)}] ==="
       )
 
       Mix.shell().info("  block   py[0]      py[1]      py[2]      bb[0]      bb[1]      bb[2]      max_diff")
@@ -540,8 +581,15 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
         max_diff = Enum.max(diffs)
         cols = Enum.map(py3, &Float.round(&1, 4)) ++ Enum.map(bb3, &Float.round(&1, 4))
 
+        label =
+          cond do
+            i == 0 -> "pre  "
+            i == n - 1 -> "norm "
+            true -> lpad(i - 1, 5)
+          end
+
         Mix.shell().info(
-          "  #{lpad(i, 5)}  " <>
+          "  #{label}  " <>
             (cols |> Enum.map(&lpad(&1, 9)) |> Enum.join("  ")) <>
             "    #{Float.round(max_diff, 5)}"
         )
@@ -556,6 +604,28 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
 
     print_text_block_table.("early text (idx 2)", "text_per_block_early_text_first3",
       "text_per_block_early_text_first3")
+
+    Mix.shell().info("\n=== Full-vector hidden state diff (all 2048 dims) ===")
+    Mix.shell().info("  position             pre-block          post-block-0")
+
+    for pos <- ["early_text_2", "mid_visual_150", "last"] do
+      py_pre = py["text_pre_block_full"][pos]
+      bb_pre = bb["text_pre_block_full"][pos]
+      py_post = py["text_post_block_0_full"][pos]
+      bb_post = bb["text_post_block_0_full"][pos]
+
+      pre_max =
+        Enum.zip(py_pre, bb_pre) |> Enum.map(fn {a, b} -> abs(a - b) end) |> Enum.max()
+
+      post_max =
+        Enum.zip(py_post, bb_post) |> Enum.map(fn {a, b} -> abs(a - b) end) |> Enum.max()
+
+      Mix.shell().info(
+        "  #{String.pad_trailing(pos, 20)} " <>
+          "max=#{Float.round(pre_max, 6) |> to_string() |> String.pad_leading(10)}      " <>
+          "max=#{Float.round(post_max, 6) |> to_string() |> String.pad_leading(10)}"
+      )
+    end
   end
 
   defp max_abs_diff(a, b, n) do
