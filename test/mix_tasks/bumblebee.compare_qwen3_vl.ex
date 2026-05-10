@@ -119,6 +119,28 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
         return_tensors="pt",
     )
 
+    # Capture intermediate values inside block 0's attention via forward
+    # hooks. We sample at idx 150 (mid-visual) to localise where drift vs
+    # Bumblebee enters during the first decoder block.
+    _captures = {}
+
+    def _make_hook(name):
+        def _hook(_mod, _args, output):
+            t = output[0] if isinstance(output, tuple) else output
+            _captures[name] = t.detach().cpu()
+        return _hook
+
+    _attn0 = model.model.language_model.layers[0].self_attn
+    _ln0 = model.model.language_model.layers[0].input_layernorm
+    _hooks = [
+        _ln0.register_forward_hook(_make_hook("input_layernorm")),
+        _attn0.q_proj.register_forward_hook(_make_hook("q_proj")),
+        _attn0.k_proj.register_forward_hook(_make_hook("k_proj")),
+        _attn0.v_proj.register_forward_hook(_make_hook("v_proj")),
+        _attn0.q_norm.register_forward_hook(_make_hook("q_norm")),
+        _attn0.k_norm.register_forward_hook(_make_hook("k_norm")),
+    ]
+
     with torch.no_grad():
         # Vision-only output for an apples-to-apples comparison.
         # Run the vision tower with output_hidden_states=True so we get
@@ -135,6 +157,16 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
         visual = vision_output.pooler_output
 
         out = model(**inputs, use_cache=False, output_hidden_states=True)
+
+    for _h in _hooks:
+        _h.remove()
+
+    # q_proj/k_proj/v_proj outputs are flat (1, seq, num_heads * head_dim).
+    # q_norm / k_norm see the reshaped (1, seq, num_heads, head_dim).
+    _block0 = {
+        name: _captures[name][0, 150, :].flatten().tolist()
+        for name in ("input_layernorm", "q_proj", "k_proj", "v_proj", "q_norm", "k_norm")
+    }
 
     logits = out.logits
     text_hidden_states = out.hidden_states  # tuple, one per text block (+ embedding entry)
@@ -209,6 +241,8 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
             "mid_visual_150": text_hidden_states[1][0, 150, :].tolist(),
             "last": text_hidden_states[1][0, -1, :].tolist(),
         },
+        # Per-stage outputs inside block 0 attention at idx 150.
+        "block0_attn_idx150": _block0,
     }
     """
 
@@ -323,6 +357,8 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
       "last" => post_block_0[[0, -1, ..]] |> Nx.to_flat_list()
     }
 
+    block0_attn_idx150 = block0_attn_intermediates(model_info, pre_block, 150)
+
     # Also run the vision encoder on its own, to compare its output to
     # PyTorch's get_image_features(...). Lets us isolate whether logit
     # drift is rooted in the vision tower vs downstream processing.
@@ -357,6 +393,7 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
       "text_per_block_early_text_first3" => text_per_block_early_text_first3,
       "text_pre_block_full" => text_pre_block_full,
       "text_post_block_0_full" => text_post_block_0_full,
+      "block0_attn_idx150" => block0_attn_idx150,
       "position_ids_head" => pos_ids_head,
       "position_ids_tail" => pos_ids_tail
     }
@@ -430,6 +467,54 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
       "per_layer_count" => length(full_layers),
       "per_layer_mid_token_first3" => per_layer_mid_token_first3
     }
+  end
+
+  # Replicate block 0's attention path (input_layernorm → q/k/v projection
+  # → q/k norm) using extracted params, so we can compare each stage
+  # against PyTorch hooks at a specific position.
+  defp block0_attn_intermediates(model_info, pre_block, idx) do
+    %Axon.ModelState{data: data} = model_info.params
+    text_spec = model_info.spec.text_spec
+    eps = text_spec.layer_norm_epsilon
+
+    prefix = "text_model.decoder.blocks.0."
+    ln_w = data[prefix <> "self_attention_norm"]["weight"]
+    q_w = data[prefix <> "self_attention.query"]["kernel"]
+    k_w = data[prefix <> "self_attention.key"]["kernel"]
+    v_w = data[prefix <> "self_attention.value"]["kernel"]
+    qn_w = data[prefix <> "self_attention.query_norm"]["weight"]
+    kn_w = data[prefix <> "self_attention.key_norm"]["weight"]
+
+    normed = rms_norm_normalization(pre_block, ln_w, eps)
+    q_proj = Nx.dot(normed, q_w)
+    k_proj = Nx.dot(normed, k_w)
+    v_proj = Nx.dot(normed, v_w)
+
+    head_dim = text_spec.attention_head_size
+    {1, seq, _} = Nx.shape(q_proj)
+    q_reshaped = Nx.reshape(q_proj, {1, seq, text_spec.num_attention_heads, head_dim})
+    k_reshaped = Nx.reshape(k_proj, {1, seq, text_spec.num_key_value_heads, head_dim})
+
+    q_normed = rms_norm_normalization(q_reshaped, qn_w, eps)
+    k_normed = rms_norm_normalization(k_reshaped, kn_w, eps)
+
+    %{
+      "input_layernorm" => normed[[0, idx, ..]] |> Nx.to_flat_list(),
+      "q_proj" => q_proj[[0, idx, ..]] |> Nx.to_flat_list(),
+      "k_proj" => k_proj[[0, idx, ..]] |> Nx.to_flat_list(),
+      "v_proj" => v_proj[[0, idx, ..]] |> Nx.to_flat_list(),
+      "q_norm" => q_normed[[0, idx, .., ..]] |> Nx.to_flat_list(),
+      "k_norm" => k_normed[[0, idx, .., ..]] |> Nx.to_flat_list()
+    }
+  end
+
+  # rms_norm with :normalization upcast (matches Bumblebee.Layers default).
+  defp rms_norm_normalization(x, weight, eps) do
+    in_type = Nx.type(x)
+    x_f32 = Nx.as_type(x, :f32)
+    variance = x_f32 |> Nx.pow(2) |> Nx.mean(axes: [-1], keep_axes: true)
+    normed = x_f32 |> Nx.multiply(Nx.rsqrt(Nx.add(variance, eps))) |> Nx.as_type(in_type)
+    Nx.multiply(normed, weight)
   end
 
   defp compare(py, bb, show_logits) do
@@ -604,6 +689,27 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
 
     print_text_block_table.("early text (idx 2)", "text_per_block_early_text_first3",
       "text_per_block_early_text_first3")
+
+    Mix.shell().info("\n=== Block 0 attention intermediates at idx 150 (full vector) ===")
+    Mix.shell().info("  stage              max_abs_diff       py_max_abs       bb_max_abs")
+
+    for stage <- ~w(input_layernorm q_proj k_proj v_proj q_norm k_norm) do
+      py_v = py["block0_attn_idx150"][stage]
+      bb_v = bb["block0_attn_idx150"][stage]
+
+      diff_max =
+        Enum.zip(py_v, bb_v) |> Enum.map(fn {a, b} -> abs(a - b) end) |> Enum.max()
+
+      py_mag = py_v |> Enum.map(&abs/1) |> Enum.max()
+      bb_mag = bb_v |> Enum.map(&abs/1) |> Enum.max()
+
+      Mix.shell().info(
+        "  #{String.pad_trailing(stage, 16)} " <>
+          "  #{Float.round(diff_max, 6) |> to_string() |> String.pad_leading(12)}     " <>
+          "#{Float.round(py_mag, 6) |> to_string() |> String.pad_leading(12)}     " <>
+          "#{Float.round(bb_mag, 6) |> to_string() |> String.pad_leading(12)}"
+      )
+    end
 
     Mix.shell().info("\n=== Full-vector hidden state diff (all 2048 dims) ===")
     Mix.shell().info("  position             pre-block          post-block-0")
