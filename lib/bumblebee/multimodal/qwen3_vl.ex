@@ -121,6 +121,29 @@ defmodule Bumblebee.Multimodal.Qwen3VL do
   end
 
   @doc """
+  Featurizes `image` and reconfigures `model_info` for the resulting
+  patch grid in one call.
+
+  Returns `{model_info, image_inputs}` where `image_inputs` is the same
+  map `Bumblebee.apply_featurizer/2` would have produced, containing
+  `"pixel_values"` and `"image_grid_thw"`. The grid can be pulled out
+  via `image_inputs["image_grid_thw"][[0, ..]] |> Nx.to_list()` for
+  passing to `position_ids/3` or `num_visual_tokens/2`.
+
+      {:ok, model_info} = Bumblebee.load_model({:hf, "Qwen/Qwen3-VL-2B-Instruct"})
+      {:ok, featurizer} = Bumblebee.load_featurizer({:hf, "Qwen/Qwen3-VL-2B-Instruct"})
+
+      {model_info, image_inputs} =
+        Bumblebee.Multimodal.Qwen3VL.with_image(model_info, featurizer, image)
+  """
+  @spec with_image(map(), Bumblebee.Featurizer.t(), term()) :: {map(), map()}
+  def with_image(model_info, featurizer, image) do
+    image_inputs = Bumblebee.apply_featurizer(featurizer, image)
+    [t, h, w] = image_inputs["image_grid_thw"][[0, ..]] |> Nx.to_list()
+    {with_image_grid(model_info, t: t, h: h, w: w), image_inputs}
+  end
+
+  @doc """
   Returns the number of post-merger visual tokens for an image with the
   given patch grid. This is the number of `<|image_pad|>` tokens the
   prompt should contain between `<|vision_start|>` and `<|vision_end|>`.

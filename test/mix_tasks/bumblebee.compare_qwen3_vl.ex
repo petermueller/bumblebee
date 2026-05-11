@@ -263,8 +263,18 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
     {:ok, tokenizer} = Bumblebee.load_tokenizer({:hf, repo})
     {:ok, featurizer} = Bumblebee.load_featurizer({:hf, repo})
 
+    image = StbImage.read_file!(image_path)
+    {model_info, image_inputs} = Bumblebee.Multimodal.Qwen3VL.with_image(model_info, featurizer, image)
+    [bt, bh, bw] = image_inputs["image_grid_thw"][[0, ..]] |> Nx.to_list()
+
     [t, h, w] = py_data["image_grid_thw"] |> List.first()
-    model_info = Bumblebee.Multimodal.Qwen3VL.with_image_grid(model_info, t: t, h: h, w: w)
+
+    if {bt, bh, bw} != {t, h, w} do
+      Mix.raise(
+        "Featurizer grid mismatch: Bumblebee says (#{bt}, #{bh}, #{bw}) but " <>
+          "PyTorch processor says (#{t}, #{h}, #{w})"
+      )
+    end
 
     # Optionally drop mrope_section to fall back to standard 1D rotary —
     # used as an A/B test when investigating where logit drift comes from.
@@ -276,18 +286,6 @@ defmodule Mix.Tasks.Bumblebee.CompareQwen3Vl do
       else
         model_info
       end
-
-    image = StbImage.read_file!(image_path)
-    image_inputs = Bumblebee.apply_featurizer(featurizer, image)
-
-    [bt, bh, bw] = image_inputs["image_grid_thw"][[0, ..]] |> Nx.to_list()
-
-    if {bt, bh, bw} != {t, h, w} do
-      Mix.raise(
-        "Featurizer grid mismatch: Bumblebee says (#{bt}, #{bh}, #{bw}) but " <>
-          "PyTorch processor says (#{t}, #{h}, #{w})"
-      )
-    end
 
     input_ids = Nx.tensor([py_data["input_ids"]])
     seq_len = length(py_data["input_ids"])
