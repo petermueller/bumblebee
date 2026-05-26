@@ -48,7 +48,7 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
       ],
       deepstack_visual_indexes: [
         default: [5, 11, 17],
-        doc: "the encoder layer indices from which to extract DeepStack features (1-indexed)"
+        doc: "the encoder layer indices from which to extract DeepStack features (0-indexed)"
       ],
       activation: [
         default: :gelu_approx_tanh,
@@ -370,10 +370,8 @@ defmodule Bumblebee.Vision.Qwen3VLVision do
   defp encoder(embeddings, grid_thw, spec, opts) do
     name = opts[:name]
 
-    deepstack_indexes =
-      spec.deepstack_visual_indexes
-      |> Enum.map(&(&1 - 1))
-      |> MapSet.new()
+    # 0-indexed, matching HF's `enumerate(self.blocks)` comparison.
+    deepstack_indexes = MapSet.new(spec.deepstack_visual_indexes)
 
     head_dim = div(spec.hidden_size, spec.num_attention_heads)
     rotary_dim = div(head_dim, 2)
